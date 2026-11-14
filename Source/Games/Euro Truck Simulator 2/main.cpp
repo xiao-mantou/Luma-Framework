@@ -1,8 +1,25 @@
 ///////////////////////////////////////////////////////////////////////
-// Of course, before any of this, create a new project for your game!
-// - Copy "Templates\VisualStudio\Luma-Template.zip" into "%USERPROFILE%\Documents\Visual Studio [current version]\Templates\ProjectTemplates" (and restart Visual Studio).
-// - Right click "Games" in the solution explorer, Add -> New Project... -> Template (Luma Template Project for new games)
-// - Make sure the location is "Source\Games"!
+// Euro Truck Simulator 2 - DLAA mod, v1 probe
+//
+// Pipeline facts from a RenoDX DevKit capture (ETS2 1.62.3.3, DX11 SM5X,
+// 1920x1080, native BT.2100 PQ swapchain, in-game TAA enabled):
+//   #6127 0xB824672E  packs neighbour min/max depth into R16G16_UINT
+//                     (log quantised; NOT a float motion vector buffer)
+//   #6128 0x805A8981  TAA temporal resolve. MRT 2x R16G16B16A16_FLOAT,
+//                     SRVs: slot0/1 RGBA16F, slot3/4 R16G16_UINT,
+//                     slot15 RGBA16_UINT; CB slot 0 (256B @ 116480)
+//                     carries the per-frame jitter. <-- DLAA target
+//   #6133..#6238      UI/HUD (B8G8R8(A)8_UNORM_SRGB) composited into the
+//                     same RGBA16F target
+//   #6239 0x7258FF32  BT.2020 matrix + ST2084 PQ encode ->
+//                     R10G10B10A2_UNORM swapchain. Keep untouched.
+//
+// Colour input is linear HDR: 27.2% of pixels have a channel > 1.0 (max ~10).
+// No HDR or swapchain work is needed; this mod only replaces TAA with DLAA.
+//
+// v1 is a probe: it proves Luma's shader hashing finds the TAA resolve and
+// leaves every frame untouched. DLAA is wired in v2 once the packed uint
+// motion vectors are unpacked and the main depth is captured.
 ///////////////////////////////////////////////////////////////////////
 
 // Specify a define with the name of the game here (GAME_*).
@@ -35,9 +52,15 @@
 // To compile in different modes (e.g. "DEVELOPMENT", "TEST" etc see "global_defines.h").
 #include "..\..\Core\core.hpp"
 
+// PS hash of the TAA temporal resolve to be replaced by DLAA.
+static constexpr uint32_t kTaaResolvePS = 0x805A8981u;
+
 struct ETS2DeviceData final : public GameDeviceData
 {
    bool has_drawn_taa_resolve = false;
+   uint32_t taa_resolve_hits = 0; // cumulative, shown in the ImGui panel
+   uint32_t frame_index = 0;
+   bool enable_dlaa = false; // v1: always false, DLAA arrives in v2
 };
 
 class ETS2Game final : public Game // Go view "Source/Core/includes/game.h" for all the overridable virtual functions
@@ -101,25 +124,24 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
-      // Random pixel shader hash as an example
-      static uint32_t pixel_shader_hash_taa_resolve = Shader::Hash_StrToNum("805A8981");
-
-      // Here you can track and customize shader passes by hash, you can do whatever you want in it
-      if (!game_device_data.has_drawn_taa_resolve && original_shader_hashes.Contains(pixel_shader_hash_taa_resolve, reshade::api::shader_stage::pixel))
+      // v1 probe: verify Luma's shader hash matches the DevKit hash of the TAA
+      // resolve. If this counter stays at 0, the hash needs re-dumping with a
+      // Development build before any DLAA work can be validated.
+      if (original_shader_hashes.Contains(kTaaResolvePS, reshade::api::shader_stage::pixel))
       {
+         ++game_device_data.taa_resolve_hits;
          game_device_data.has_drawn_taa_resolve = true;
-
-         device_data.has_drawn_main_post_processing = true;
       }
 
-      return DrawOrDispatchOverrideType::None; // Don't cancel the original draw call
+      // v1 deliberately keeps the engine's TAA running and never cancels a draw.
+      return DrawOrDispatchOverrideType::None;
    }
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
       game_device_data.has_drawn_taa_resolve = false;
-      device_data.has_drawn_main_post_processing = true;
+      ++game_device_data.frame_index;
    }
 
    void LoadConfigs() override
@@ -134,6 +156,12 @@ public:
    void DrawImGuiSettings(DeviceData& device_data) override
    {
       reshade::api::effect_runtime* runtime = nullptr;
+      auto& game_device_data = GetGameDeviceData(device_data);
+
+      ImGui::Text("ETS2 DLAA probe v1");
+      ImGui::Text("TAA resolve 0x805A8981 hits: %u (frame %u)", game_device_data.taa_resolve_hits, game_device_data.frame_index);
+      ImGui::Text("DLAA: %s", game_device_data.enable_dlaa ? "requested (v2)" : "off - v1 is probe only");
+      ImGui::Separator();
 
       // Draw whatever ImGui to let users modify settings.
       if (ImGui::SliderFloat("Game Setting #01", &cb_luma_global_settings.GameSettings.GameSetting01, 0.f, 1.f, "%.3f"))
@@ -168,7 +196,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       const char* cleared_project_name = (project_name[0] == '_') ? (project_name + 1) : project_name; // Remove the potential "_" at the beginning. This can include spaces!
 
       uint32_t mod_version = 1; // Increase this to reset the game settings and shader binaries after making large changes to your mod
-      Globals::SetGlobals(cleared_project_name, "ETS2 DLAA (WIP)", nullptr /*E.g. Nexus link*/, mod_version);
+      Globals::SetGlobals(cleared_project_name, "ETS2 DLAA probe v1", nullptr /*E.g. Nexus link*/, mod_version);
 
       // The following can be toggled in the dev settings (it generally only fully applies after changing the game's resolution).
       // Default these to "false" for the mod to not do "anything" that might cause issues with the game by default.

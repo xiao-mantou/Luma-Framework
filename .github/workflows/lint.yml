@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - '*'
+    paths:
+      - 'Source/Games/Euro Truck Simulator 2/**'
+      - 'Shaders/Euro Truck Simulator 2/**'
+      - 'Source/Core/**'
+      - '.github/workflows/**'
   pull_request:
     branches:
       - main

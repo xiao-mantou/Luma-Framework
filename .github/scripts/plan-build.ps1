@@ -28,7 +28,7 @@ foreach ($m in [regex]::Matches($sln, '\{([0-9A-Fa-f-]+)\}\.([^|\r\n]+\|[^.\r\n]
 }
 
 $selected = $null # $null means all of them
-if ($EventName -eq "pull_request") {
+if ($EventName -eq "pull_request" -and -not $env:LUMA_ONLY_GAME) {
     # With "--no-renames" a moved file lists both its old and new path, so the game it left gets built too
     $changed = @(git diff --no-renames --name-only $DiffBase $DiffHead)
     if ($LASTEXITCODE -ne 0) {
@@ -49,6 +49,12 @@ if ($EventName -eq "pull_request") {
             $selected[$owner.Name] = $true
         }
     }
+}
+
+# CI can pin the build to a single game. Dependencies are still expanded below.
+if ($env:LUMA_ONLY_GAME) {
+    $selected = @{ $env:LUMA_ONLY_GAME = $true }
+    Write-Host "Forcing single-game build: $($env:LUMA_ONLY_GAME)"
 }
 
 # A selected project also builds the projects it depends on in the solution (the x64 SR Bridge Helper a game packages), even if the PR doesn't touch them

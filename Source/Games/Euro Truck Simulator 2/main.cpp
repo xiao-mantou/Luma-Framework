@@ -63,17 +63,17 @@ public:
 
       // Define these according to the game's original technical details and the mod's implementation (see their declarations for more).
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('0'); // What space are the colors in? Was the swapchain linear (sRGB texture format)? Did we change post processing to store in linear space?
-      GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0'); // Whether we do gamma correction and paper white scaling during post processing or we delay them until the final display composition pass
-      GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('0'); // What SDR transfer curve was the game using? Most modern games used sRGB in SDR
-      GetShaderDefineData(GAMMA_CORRECTION_TYPE_HASH).SetDefaultValue('1'); // What SDR transfer curve to we want to emulate? This is relevant even if we work in linear space, as there can be a gamma mismatch on it
-      GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('0'); // How does the UI draw in?
+      GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');  // Whether we do gamma correction and paper white scaling during post processing or we delay them until the final display composition pass
+      GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('0');   // What SDR transfer curve was the game using? Most modern games used sRGB in SDR
+      GetShaderDefineData(GAMMA_CORRECTION_TYPE_HASH).SetDefaultValue('1');   // What SDR transfer curve to we want to emulate? This is relevant even if we work in linear space, as there can be a gamma mismatch on it
+      GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('0');            // How does the UI draw in?
 
       // Customize the cbuffers indexes here. They should be between 0 and 13 ("D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT - 1"),
       // set them to invalid values (e.g. -1) to not set them (they won't be uploaded to the GPU, and thus not usable in shaders). All their values need to be different if they are valid.
       // These will be automatically sent to the GPU for every shader pass the mod overrides.
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12; // Needed for debugging textures and having custom per pass data (including handling the final pass properly).
-      luma_ui_cbuffer_index = -1; // Optional, see "UI_DRAW_TYPE" (this is for type 1)
+      luma_ui_cbuffer_index = -1;   // Optional, see "UI_DRAW_TYPE" (this is for type 1)
 
       // Init the game settings here, you could also load them from ini in "LoadConfigs()".
       // These can be defined in a header shared between shaders and c++, and are sent to the GPU every time they change.
@@ -134,7 +134,7 @@ public:
    void DrawImGuiSettings(DeviceData& device_data) override
    {
       reshade::api::effect_runtime* runtime = nullptr;
-      
+
       // Draw whatever ImGui to let users modify settings.
       if (ImGui::SliderFloat("Game Setting #01", &cb_luma_global_settings.GameSettings.GameSetting01, 0.f, 1.f, "%.3f"))
          reshade::set_config_value(runtime, NAME, "GameSetting01", cb_luma_global_settings.GameSettings.GameSetting01);
@@ -144,7 +144,7 @@ public:
 
       uint GameSetting02_min = 0;
       uint GameSetting02_max = 50;
-      if (ImGui::SliderScalar("Game Setting #02", ImGuiDataType_U32, &cb_luma_global_settings.GameSettings.GameSetting02,  &GameSetting02_min, &GameSetting02_max, "%u"))
+      if (ImGui::SliderScalar("Game Setting #02", ImGuiDataType_U32, &cb_luma_global_settings.GameSettings.GameSetting02, &GameSetting02_min, &GameSetting02_max, "%u"))
          reshade::set_config_value(runtime, NAME, "GameSetting02", cb_luma_global_settings.GameSettings.GameSetting02);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Hi! This changes Game Setting #02.");
@@ -179,29 +179,29 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_format_upgrades_type = TextureFormatUpgradesType::None;
       // Texture upgrades (8 bit unorm and 11 bit float etc to 16 bit float)
       texture_upgrade_formats = {
-            reshade::api::format::r8g8b8a8_unorm,
-            reshade::api::format::r8g8b8a8_unorm_srgb,
-            reshade::api::format::r8g8b8a8_typeless,
-            reshade::api::format::r8g8b8x8_unorm,
-            reshade::api::format::r8g8b8x8_unorm_srgb,
-            reshade::api::format::b8g8r8a8_unorm,
-            reshade::api::format::b8g8r8a8_unorm_srgb,
-            reshade::api::format::b8g8r8a8_typeless,
-            reshade::api::format::b8g8r8x8_unorm,
-            reshade::api::format::b8g8r8x8_unorm_srgb,
-            reshade::api::format::b8g8r8x8_typeless,
+         reshade::api::format::r8g8b8a8_unorm,
+         reshade::api::format::r8g8b8a8_unorm_srgb,
+         reshade::api::format::r8g8b8a8_typeless,
+         reshade::api::format::r8g8b8x8_unorm,
+         reshade::api::format::r8g8b8x8_unorm_srgb,
+         reshade::api::format::b8g8r8a8_unorm,
+         reshade::api::format::b8g8r8a8_unorm_srgb,
+         reshade::api::format::b8g8r8a8_typeless,
+         reshade::api::format::b8g8r8x8_unorm,
+         reshade::api::format::b8g8r8x8_unorm_srgb,
+         reshade::api::format::b8g8r8x8_typeless,
 
-            reshade::api::format::r10g10b10a2_unorm,
-            reshade::api::format::r10g10b10a2_typeless,
+         reshade::api::format::r10g10b10a2_unorm,
+         reshade::api::format::r10g10b10a2_typeless,
 
-            //reshade::api::format::r16g16b16a16_unorm,
+         // reshade::api::format::r16g16b16a16_unorm,
 
-            reshade::api::format::r11g11b10_float,
+         reshade::api::format::r11g11b10_float,
       };
       // Set this to the size and type of the main color grading LUT you might want to upgrade (optional)
       texture_format_upgrades_lut_size = 32;
       texture_format_upgrades_lut_dimensions = LUTDimensions::_2D;
-		// In case the textures failed to upgrade, tweak the filtering conditions to be more lenient (e.g. aspect ratio checks etc).
+      // In case the textures failed to upgrade, tweak the filtering conditions to be more lenient (e.g. aspect ratio checks etc).
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio;
 
       // Update samples to override the bias, based on the rendering resolution etc

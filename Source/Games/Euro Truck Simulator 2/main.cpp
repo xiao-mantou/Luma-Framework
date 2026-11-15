@@ -104,6 +104,19 @@ struct ETS2DeviceData final : public GameDeviceData
    uint32_t jitter_changes = 0;
    uint32_t next_jitter_log_frame = 0;
    com_ptr<ID3D11Buffer> jitter_staging;
+   com_ptr<ID3D11Resource> main_depth;
+   UINT depth_w = 0;
+   UINT depth_h = 0;
+   int depth_format = 0;
+   UINT target_w = 0; // #6128 RTV0 size; the resolution DLAA actually renders at
+   UINT target_h = 0;
+   ID3D11DepthStencilView* last_dsv_ptr = nullptr; // comparison only, never dereferenced
+   uint32_t depth_probe_tick = 0;
+   int depth_func = 0;
+   int inverted_depth = 0;
+   uint32_t depth_rejected = 0;
+   bool depth_logged = false;
+   bool depth_func_logged = false;
    com_ptr<ID3D11Texture2D> zero_mv;        // placeholder: all-zero float2 motion
    com_ptr<ID3D11Texture2D> const_depth;    // placeholder: constant HW depth
    com_ptr<ID3D11Texture2D> uav_output;     // proxy when RTV0 lacks UAV
@@ -242,6 +255,143 @@ static void ApplyDlaaMarker(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT 
    }
    const D3D11_BOX box = {0, 0, 0, mw, mh, 1};
    ctx->UpdateSubresource(res, 0, &box, marker.data(), mw * 8, 0);
+}
+
+static const char* DepthFormatName(DXGI_FORMAT f)
+{
+   switch (f)
+   {
+   case DXGI_FORMAT_R32_TYPELESS:
+      return "R32_TYPELESS";
+   case DXGI_FORMAT_D32_FLOAT:
+      return "D32_FLOAT";
+   case DXGI_FORMAT_R24G8_TYPELESS:
+      return "R24G8_TYPELESS";
+   case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      return "D24_UNORM_S8_UINT";
+   case DXGI_FORMAT_R16_TYPELESS:
+      return "R16_TYPELESS";
+   case DXGI_FORMAT_D16_UNORM:
+      return "D16_UNORM";
+   default:
+      return "other";
+   }
+}
+
+static const char* DepthFuncName(D3D11_COMPARISON_FUNC f)
+{
+   switch (f)
+   {
+   case D3D11_COMPARISON_NEVER:
+      return "NEVER";
+   case D3D11_COMPARISON_LESS:
+      return "LESS";
+   case D3D11_COMPARISON_EQUAL:
+      return "EQUAL";
+   case D3D11_COMPARISON_LESS_EQUAL:
+      return "LESS_EQUAL";
+   case D3D11_COMPARISON_GREATER:
+      return "GREATER";
+   case D3D11_COMPARISON_NOT_EQUAL:
+      return "NOT_EQUAL";
+   case D3D11_COMPARISON_GREATER_EQUAL:
+      return "GREATER_EQUAL";
+   case D3D11_COMPARISON_ALWAYS:
+      return "ALWAYS";
+   default:
+      return "unknown";
+   }
+}
+
+// Sample the geometry passes for the main hardware depth buffer. #6128 runs
+// with depth testing disabled (DevKit: depth=0), so the DSV has to be captured
+// earlier. Mirror views (512x512 / 512x1024) and shadow atlases are rejected by
+// size / array / sample count. The DSV pointer is only compared, never used.
+static void ProbeMainDepth(ID3D11DeviceContext* ctx, ETS2DeviceData& gd)
+{
+   ++gd.depth_probe_tick;
+   if ((gd.depth_probe_tick & 7u) != 0u) // 1/8 of the draws is plenty
+      return;
+   ID3D11DepthStencilView* dsv = nullptr;
+   ctx->OMGetRenderTargets(0, nullptr, &dsv);
+   if (!dsv)
+      return;
+   if (dsv == gd.last_dsv_ptr)
+   {
+      dsv->Release(); // OMGetRenderTargets AddRef'd it
+      return;
+   }
+   gd.last_dsv_ptr = dsv;
+   com_ptr<ID3D11Resource> candidate;
+   dsv->GetResource(&candidate);
+   dsv->Release();
+   if (!candidate)
+      return;
+   com_ptr<ID3D11Texture2D> tex;
+   if (FAILED(candidate->QueryInterface(&tex)) || !tex)
+      return;
+   D3D11_TEXTURE2D_DESC d = {};
+   tex->GetDesc(&d);
+   if (d.ArraySize != 1 || d.SampleDesc.Count != 1)
+   {
+      ++gd.depth_rejected;
+      return;
+   }
+   // Accept only full-resolution depth. Threshold comes from #6128's RTV0,
+   // which follows the game's render scale - not the swapchain, not 1080p.
+   const bool have_target = gd.target_w > 0 && gd.target_h > 0;
+   const bool accepted = have_target
+                            ? (d.Width >= gd.target_w * 0.9f && d.Height >= gd.target_h * 0.9f)
+                            : (static_cast<uint64_t>(d.Width) * d.Height > static_cast<uint64_t>(gd.depth_w) * gd.depth_h);
+   if (!accepted)
+   {
+      if (gd.depth_rejected < 3)
+      {
+         ++gd.depth_rejected;
+         const std::string msg = "[ETS2 DLAA] depth rejected " + std::to_string(d.Width) + "x" +
+                                 std::to_string(d.Height) + " fmt=" + std::to_string(static_cast<int>(d.Format));
+         reshade::log::message(reshade::log::level::warning, msg.c_str());
+      }
+      return;
+   }
+   if (gd.main_depth && static_cast<uint64_t>(d.Width) * d.Height < static_cast<uint64_t>(gd.depth_w) * gd.depth_h)
+      return;
+   gd.main_depth = candidate;
+   gd.depth_w = d.Width;
+   gd.depth_h = d.Height;
+   gd.depth_format = static_cast<int>(d.Format);
+   if (!gd.depth_logged)
+   {
+      gd.depth_logged = true;
+      const std::string msg = "[ETS2 DLAA] depth dsv=" +
+                              std::to_string(reinterpret_cast<unsigned long long>(dsv)) +
+                              " fmt=" + std::to_string(static_cast<int>(d.Format)) + " (" + DepthFormatName(d.Format) + ")" +
+                              " size=" + std::to_string(d.Width) + "x" + std::to_string(d.Height) +
+                              " array=" + std::to_string(d.ArraySize) + " sample=" + std::to_string(d.SampleDesc.Count);
+      reshade::log::message(reshade::log::level::warning, msg.c_str());
+   }
+   if (!gd.depth_func_logged)
+   {
+      ID3D11DepthStencilState* state = nullptr;
+      UINT stencil_ref = 0;
+      ctx->OMGetDepthStencilState(&state, &stencil_ref);
+      if (state)
+      {
+         D3D11_DEPTH_STENCIL_DESC ds = {};
+         state->GetDesc(&ds);
+         state->Release();
+         gd.depth_func_logged = true;
+         gd.depth_func = static_cast<int>(ds.DepthFunc);
+         const bool reversed_z = ds.DepthFunc == D3D11_COMPARISON_GREATER || ds.DepthFunc == D3D11_COMPARISON_GREATER_EQUAL;
+         gd.inverted_depth = reversed_z ? 1 : 0;
+         const std::string msg = "[ETS2 DLAA] depth_func=" + std::to_string(gd.depth_func) + " (" +
+                                 DepthFuncName(ds.DepthFunc) + ") enable=" + std::to_string(ds.DepthEnable ? 1 : 0) +
+                                 " write=" + std::to_string(ds.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL ? 1 : 0) +
+                                 " reversed_z=" + std::to_string(reversed_z ? 1 : 0) +
+                                 " inverted_depth=" + std::to_string(gd.inverted_depth);
+         reshade::log::message(reshade::log::level::warning, msg.c_str());
+      }
+   }
 }
 
 // #6128 reads its per-frame jitter from cb0[8].xy (UV space). The engine
@@ -453,6 +603,8 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    output_tex->GetDesc(&out_desc);
    const UINT w = out_desc.Width;
    const UINT h = out_desc.Height;
+   gd.target_w = w;
+   gd.target_h = h;
 
    // Debug: prove the output path itself. If the screen turns solid red, the
    // unbind/Copy/restore chain works and a black DLAA frame means NGX rejected
@@ -552,8 +704,8 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    settings.output_height = h;
    settings.render_width = w;
    settings.render_height = h;
-   settings.hdr = true;             // ETS2 resolves in linear RGBA16F
-   settings.inverted_depth = false; // TODO: verify ETS2 depth direction
+   settings.hdr = true;                              // ETS2 resolves in linear RGBA16F
+   settings.inverted_depth = gd.inverted_depth != 0; // set from the geometry pass DepthFunc
    settings.mvs_jittered = false;
    settings.auto_exposure = false;
    settings.mvs_x_scale = 1.f;
@@ -615,7 +767,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    draw.source_color = dlss_source;
    draw.output_color = dlss_output;
    draw.motion_vectors = gd.zero_mv.get();
-   draw.depth_buffer = depth_resource ? depth_resource.get() : gd.const_depth.get();
+   draw.depth_buffer = gd.main_depth ? gd.main_depth.get() : (depth_resource ? depth_resource.get() : gd.const_depth.get());
    draw.render_width = w;
    draw.render_height = h;
    draw.jitter_x = 0.f;
@@ -777,6 +929,10 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
+#if ENABLE_SR
+      if (!is_custom_pass)
+         ProbeMainDepth(native_device_context, game_device_data);
+#endif
       // v1 probe: verify Luma's shader hash matches the DevKit hash of the TAA
       // resolve. If this counter stays at 0, the hash needs re-dumping with a
       // Development build before any DLAA work can be validated.
@@ -784,6 +940,23 @@ public:
       {
          ++game_device_data.taa_resolve_hits;
          game_device_data.has_drawn_taa_resolve = true;
+#if ENABLE_SR
+         if (game_device_data.frame_index >= game_device_data.next_heartbeat_frame)
+         {
+            game_device_data.next_heartbeat_frame = game_device_data.frame_index + 120;
+            const std::string hb = "[ETS2 DLAA] heartbeat f=" + std::to_string(game_device_data.frame_index) +
+                                   " hits=" + std::to_string(game_device_data.taa_resolve_hits) +
+                                   " draws=" + std::to_string(game_device_data.sr_draws) +
+                                   " fails=" + std::to_string(game_device_data.sr_failures) +
+                                   " cb=" + std::to_string(game_device_data.original_draw_available ? 1 : 0) +
+                                   " keep=" + std::to_string(game_device_data.keep_engine_resolve ? 1 : 0) +
+                                   " slot=" + std::to_string(game_device_data.resolved_source_slot) +
+                                   " same=" + std::to_string(game_device_data.source_equals_output ? 1 : 0) +
+                                   " dsv=" + std::to_string(game_device_data.depth_w) + "x" + std::to_string(game_device_data.depth_h) +
+                                   " invz=" + std::to_string(game_device_data.inverted_depth);
+            reshade::log::message(reshade::log::level::warning, hb.c_str());
+         }
+#endif
 
          // v2 stage 1: prove this resolve is the sole writer of the final colour.
          // With the toggle on the frame should turn into an un-resolved, jittered
@@ -813,19 +986,6 @@ public:
             if (ran_original)
                return DrawOrDispatchOverrideType::Replaced;
          }
-         if (game_device_data.frame_index >= game_device_data.next_heartbeat_frame)
-         {
-            game_device_data.next_heartbeat_frame = game_device_data.frame_index + 120;
-            const std::string hb = "[ETS2 DLAA] heartbeat f=" + std::to_string(game_device_data.frame_index) +
-                                   " hits=" + std::to_string(game_device_data.taa_resolve_hits) +
-                                   " draws=" + std::to_string(game_device_data.sr_draws) +
-                                   " fails=" + std::to_string(game_device_data.sr_failures) +
-                                   " cb=" + std::to_string(game_device_data.original_draw_available ? 1 : 0) +
-                                   " keep=" + std::to_string(game_device_data.keep_engine_resolve ? 1 : 0) +
-                                   " slot=" + std::to_string(game_device_data.resolved_source_slot) +
-                                   " same=" + std::to_string(game_device_data.source_equals_output ? 1 : 0);
-            reshade::log::message(reshade::log::level::warning, hb.c_str());
-         }
 #endif
       }
 
@@ -854,7 +1014,9 @@ public:
       reshade::get_config_value(runtime, NAME, "SourceSlot", g_source_slot_ini);
       reshade::get_config_value(runtime, NAME, "KeepEngineResolve", g_keep_engine_resolve_ini);
       reshade::get_config_value(runtime, NAME, "MarkDlaaOutput", g_mark_dlaa_output_ini);
-      reshade::get_config_value(runtime, NAME, "UseGameJitter", g_use_game_jitter_ini);
+      // New key: the old UseGameJitter=0 left over from A/B testing must not
+      // silently disable jitter on the next launch.
+      reshade::get_config_value(runtime, NAME, "UseGameJitterV2", g_use_game_jitter_ini);
       reshade::get_config_value(runtime, NAME, "InvertJitter", g_invert_jitter_ini);
    }
 
@@ -895,13 +1057,16 @@ public:
       if (ImGui::Checkbox("Use game jitter (CB0[8].xy)", &game_device_data.use_game_jitter))
       {
          int value = game_device_data.use_game_jitter ? 1 : 0;
-         reshade::set_config_value(runtime, NAME, "UseGameJitter", value);
+         reshade::set_config_value(runtime, NAME, "UseGameJitterV2", value);
       }
       if (ImGui::Checkbox("Invert jitter sign", &game_device_data.invert_jitter))
       {
          int value = game_device_data.invert_jitter ? 1 : 0;
          reshade::set_config_value(runtime, NAME, "InvertJitter", value);
       }
+      ImGui::Text("depth %ux%u fmt=%d depth_func=%d reversed_z=%d captured=%d", game_device_data.depth_w,
+         game_device_data.depth_h, game_device_data.depth_format, game_device_data.depth_func,
+         game_device_data.inverted_depth, game_device_data.main_depth ? 1 : 0);
       ImGui::Text("jitter uv=(%.6f,%.6f) px=(%.3f,%.3f) first=%u ok=%d", game_device_data.jitter_uv_x,
          game_device_data.jitter_uv_y, game_device_data.jitter_px_x, game_device_data.jitter_px_y,
          game_device_data.jitter_first, game_device_data.jitter_ok ? 1 : 0);

@@ -65,6 +65,7 @@ static int g_test_output_path_ini = 0;
 static int g_bypass_ngx_ini = 0;
 static int g_source_slot_ini = -1; // -1 = auto (pick first RGBA16F SRV that is not RTV0)
 static int g_keep_engine_resolve_ini = 1;
+static int g_mark_dlaa_output_ini = 0;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -84,6 +85,8 @@ struct ETS2DeviceData final : public GameDeviceData
    bool original_draw_available = false;
    uint32_t next_stats_frame = 0;
    uint32_t stats_logs = 0;
+   bool mark_dlaa_output = false; // debug: stamp a magenta block on our output
+   uint32_t next_heartbeat_frame = 0;
    com_ptr<ID3D11Texture2D> zero_mv;        // placeholder: all-zero float2 motion
    com_ptr<ID3D11Texture2D> const_depth;    // placeholder: constant HW depth
    com_ptr<ID3D11Texture2D> uav_output;     // proxy when RTV0 lacks UAV
@@ -200,6 +203,28 @@ static std::string StatsText(const TexStats& st)
    char buf[128];
    sprintf_s(buf, "mean=%.3f max=%.3f nz=%.2f", st.mean, st.max, st.nonzero);
    return buf;
+}
+
+// Stamps a 128x128 magenta block into the top-left of the resource we are
+// about to hand back to the game. Seeing it on screen proves our write landed.
+static void ApplyDlaaMarker(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT w, UINT h)
+{
+   constexpr UINT kSize = 128;
+   const UINT mw = w < kSize ? w : kSize;
+   const UINT mh = h < kSize ? h : kSize;
+   static std::vector<uint16_t> marker;
+   if (marker.empty())
+   {
+      marker.assign(static_cast<size_t>(mw) * mh * 4, 0);
+      for (size_t i = 0; i < static_cast<size_t>(mw) * mh; ++i)
+      {
+         marker[i * 4 + 0] = 0x3C00; // half 1.0 red
+         marker[i * 4 + 2] = 0x3C00; // half 1.0 blue
+         marker[i * 4 + 3] = 0x3C00; // alpha
+      }
+   }
+   const D3D11_BOX box = {0, 0, 0, mw, mh, 1};
+   ctx->UpdateSubresource(res, 0, &box, marker.data(), mw * 8, 0);
 }
 
 static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data, ETS2DeviceData& gd)
@@ -377,6 +402,8 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
       if (!same_resource)
          ctx->CopyResource(output_color.get(), source_color.get());
+      if (gd.mark_dlaa_output)
+         ApplyDlaaMarker(ctx, output_color.get(), w, h);
       static bool logged_bypass_copy = false;
       if (!logged_bypass_copy)
       {
@@ -531,6 +558,8 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    ID3D11ShaderResourceView* null_srvs[16] = {};
    ctx->PSSetShaderResources(0, 16, null_srvs);
 
+   if (draw_ok && gd.mark_dlaa_output)
+      ApplyDlaaMarker(ctx, dlss_output, w, h);
    if (draw_ok && need_copy)
       ctx->CopyResource(output_color.get(), dlss_output);
 
@@ -628,6 +657,7 @@ public:
       gd->bypass_ngx = g_bypass_ngx_ini != 0;
       gd->source_slot = g_source_slot_ini;
       gd->keep_engine_resolve = g_keep_engine_resolve_ini != 0;
+      gd->mark_dlaa_output = g_mark_dlaa_output_ini != 0;
 #endif
    }
 
@@ -671,6 +701,19 @@ public:
             if (ran_original)
                return DrawOrDispatchOverrideType::Replaced;
          }
+         if (game_device_data.frame_index >= game_device_data.next_heartbeat_frame)
+         {
+            game_device_data.next_heartbeat_frame = game_device_data.frame_index + 120;
+            const std::string hb = "[ETS2 DLAA] heartbeat f=" + std::to_string(game_device_data.frame_index) +
+                                   " hits=" + std::to_string(game_device_data.taa_resolve_hits) +
+                                   " draws=" + std::to_string(game_device_data.sr_draws) +
+                                   " fails=" + std::to_string(game_device_data.sr_failures) +
+                                   " cb=" + std::to_string(game_device_data.original_draw_available ? 1 : 0) +
+                                   " keep=" + std::to_string(game_device_data.keep_engine_resolve ? 1 : 0) +
+                                   " slot=" + std::to_string(game_device_data.resolved_source_slot) +
+                                   " same=" + std::to_string(game_device_data.source_equals_output ? 1 : 0);
+            reshade::log::message(reshade::log::level::warning, hb.c_str());
+         }
 #endif
       }
 
@@ -698,6 +741,7 @@ public:
       reshade::get_config_value(runtime, NAME, "BypassNgx", g_bypass_ngx_ini);
       reshade::get_config_value(runtime, NAME, "SourceSlot", g_source_slot_ini);
       reshade::get_config_value(runtime, NAME, "KeepEngineResolve", g_keep_engine_resolve_ini);
+      reshade::get_config_value(runtime, NAME, "MarkDlaaOutput", g_mark_dlaa_output_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -734,6 +778,11 @@ public:
          reshade::set_config_value(runtime, NAME, "KeepEngineResolve", value);
       }
       ImGui::Text("original draw callback: %s", game_device_data.original_draw_available ? "available" : "MISSING");
+      if (ImGui::Checkbox("Mark our output (magenta block, proves overwrite)", &game_device_data.mark_dlaa_output))
+      {
+         int value = game_device_data.mark_dlaa_output ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "MarkDlaaOutput", value);
+      }
       if (ImGui::SliderInt("Colour SRV slot (-1=auto)", &game_device_data.source_slot, -1, 7))
          reshade::set_config_value(runtime, NAME, "SourceSlot", game_device_data.source_slot);
       ImGui::Text("resolved slot=%d source==output=%d", game_device_data.resolved_source_slot, game_device_data.source_equals_output ? 1 : 0);

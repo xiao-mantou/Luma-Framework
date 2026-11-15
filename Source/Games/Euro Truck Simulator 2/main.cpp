@@ -39,6 +39,9 @@
 
 // DLSS/FSR are toggled via the "Luma Properties" page in the project properties (UseLumaNGX/UseLumaFSR).
 
+// Needed to run the engine's own TAA resolve before overwriting its colour RTV.
+#define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
+
 // Instead of "manually" including the "core" library, we simply include its main code file (which is a header).
 // The library in itself is standalone, as in, it compiles fine and could directly be used as a template addon etc if built as dll but,
 // there's a major limitation in how libraries dependencies work by nature, and that is that you can only make
@@ -61,6 +64,7 @@ static int g_enable_dlaa_ini = 0;
 static int g_test_output_path_ini = 0;
 static int g_bypass_ngx_ini = 0;
 static int g_source_slot_ini = -1; // -1 = auto (pick first RGBA16F SRV that is not RTV0)
+static int g_keep_engine_resolve_ini = 1;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -75,7 +79,11 @@ struct ETS2DeviceData final : public GameDeviceData
    bool bypass_ngx = false; // debug: copy the colour SRV straight into RTV0
    int source_slot = -1;    // -1 = auto
    int resolved_source_slot = 0;
-   bool source_equals_output = false;       // true => NGX would read back its own output
+   bool source_equals_output = false; // true => NGX would read back its own output
+   bool keep_engine_resolve = true;   // run the original draw first, then overwrite RTV0
+   bool original_draw_available = false;
+   uint32_t next_stats_frame = 0;
+   uint32_t stats_logs = 0;
    com_ptr<ID3D11Texture2D> zero_mv;        // placeholder: all-zero float2 motion
    com_ptr<ID3D11Texture2D> const_depth;    // placeholder: constant HW depth
    com_ptr<ID3D11Texture2D> uav_output;     // proxy when RTV0 lacks UAV
@@ -293,12 +301,12 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       reshade::log::message(reshade::log::level::warning, line.c_str());
    }
 
-   // One-shot readback: which SRV actually carries the current frame colour?
-   static bool logged_stats = false;
-   if (!logged_stats)
+   // Periodic readback: a single frame can catch a cleared/ping-pong buffer.
+   if (gd.frame_index >= gd.next_stats_frame && gd.stats_logs < 8)
    {
-      logged_stats = true;
-      std::string stats = "[ETS2 DLAA] srv_stats";
+      gd.next_stats_frame = gd.frame_index + 60;
+      ++gd.stats_logs;
+      std::string stats = "[ETS2 DLAA] srv_stats f=" + std::to_string(gd.frame_index);
       for (int i = 0; i < 8; ++i)
       {
          if (!srv_res[i] || srv_fmt[i] != DXGI_FORMAT_R16G16B16A16_FLOAT)
@@ -619,6 +627,7 @@ public:
 #if ENABLE_SR
       gd->bypass_ngx = g_bypass_ngx_ini != 0;
       gd->source_slot = g_source_slot_ini;
+      gd->keep_engine_resolve = g_keep_engine_resolve_ini != 0;
 #endif
    }
 
@@ -643,12 +652,24 @@ public:
 #if ENABLE_SR
          if (game_device_data.enable_dlaa)
          {
+            game_device_data.original_draw_available = original_draw_dispatch_func && *original_draw_dispatch_func;
+            bool ran_original = false;
+            if (game_device_data.keep_engine_resolve && game_device_data.original_draw_available)
+            {
+               // #6128 writes MRT 2 targets. Keep the engine's history/aux target
+               // intact, then replace only RTV0 with the DLAA result.
+               (*original_draw_dispatch_func)();
+               ran_original = true;
+            }
             if (TryDrawDLAA(native_device, native_device_context, device_data, game_device_data))
             {
                ++game_device_data.sr_draws;
                return DrawOrDispatchOverrideType::Replaced;
             }
             ++game_device_data.sr_failures;
+            // Never let core issue the draw a second time.
+            if (ran_original)
+               return DrawOrDispatchOverrideType::Replaced;
          }
 #endif
       }
@@ -676,6 +697,7 @@ public:
       reshade::get_config_value(runtime, NAME, "TestOutputPath", g_test_output_path_ini);
       reshade::get_config_value(runtime, NAME, "BypassNgx", g_bypass_ngx_ini);
       reshade::get_config_value(runtime, NAME, "SourceSlot", g_source_slot_ini);
+      reshade::get_config_value(runtime, NAME, "KeepEngineResolve", g_keep_engine_resolve_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -706,6 +728,12 @@ public:
          int value = game_device_data.bypass_ngx ? 1 : 0;
          reshade::set_config_value(runtime, NAME, "BypassNgx", value);
       }
+      if (ImGui::Checkbox("Keep engine TAA resolve (then overwrite RTV0)", &game_device_data.keep_engine_resolve))
+      {
+         int value = game_device_data.keep_engine_resolve ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "KeepEngineResolve", value);
+      }
+      ImGui::Text("original draw callback: %s", game_device_data.original_draw_available ? "available" : "MISSING");
       if (ImGui::SliderInt("Colour SRV slot (-1=auto)", &game_device_data.source_slot, -1, 7))
          reshade::set_config_value(runtime, NAME, "SourceSlot", game_device_data.source_slot);
       ImGui::Text("resolved slot=%d source==output=%d", game_device_data.resolved_source_slot, game_device_data.source_equals_output ? 1 : 0);

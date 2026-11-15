@@ -211,6 +211,20 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       need_copy = true;
    }
 
+   // One-shot branch diagnostic: straight UAV write into RTV0 vs. UAV proxy + CopyResource.
+   static bool logged_branch = false;
+   if (!logged_branch)
+   {
+      logged_branch = true;
+      const std::string branch = "[ETS2 DLAA] branch need_copy=" + std::to_string(need_copy ? 1 : 0) +
+                                 " bind_flags=0x" + std::to_string(out_desc.BindFlags) +
+                                 " has_uav=" + std::to_string((out_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0 ? 1 : 0) +
+                                 " size=" + std::to_string(w) + "x" + std::to_string(h) +
+                                 " format=" + std::to_string(static_cast<int>(out_desc.Format)) +
+                                 " depth=" + std::to_string(depth_resource ? 1 : 0);
+      reshade::log::message(reshade::log::level::warning, branch.c_str());
+   }
+
    SR::SuperResolutionImpl::DrawData draw = {};
    draw.source_color = source_color.get();
    draw.output_color = dlss_output;
@@ -222,13 +236,25 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    draw.jitter_y = 0.f;
    draw.reset = device_data.force_reset_sr;
 
-   if (!impl->Draw(instance, ctx, draw))
+   // NGX writes through a UAV while the same resource is still bound as the
+   // current render target. D3D11 rejects that conflict, and CopyResource into
+   // a bound RTV is illegal too. Unbind the OM for Draw + copy, then restore.
+   ID3D11RenderTargetView* saved_rtv = rtv.get();
+   ID3D11DepthStencilView* saved_dsv = dsv.get();
+   ID3D11RenderTargetView* null_rtv = nullptr;
+   ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+
+   const bool draw_ok = impl->Draw(instance, ctx, draw);
+   if (draw_ok && need_copy)
+      ctx->CopyResource(output_color.get(), dlss_output);
+
+   ctx->OMSetRenderTargets(1, &saved_rtv, saved_dsv);
+
+   if (!draw_ok)
    {
       SetSrStatus(gd, "Draw failed");
       return false;
    }
-   if (need_copy)
-      ctx->CopyResource(output_color.get(), dlss_output);
 
    SetSrStatus(gd, depth_resource ? "DLAA active (zero MV, real DSV)" : "DLAA active (zero MV, constant depth)");
    gd.dlaa_drew_this_frame = true;

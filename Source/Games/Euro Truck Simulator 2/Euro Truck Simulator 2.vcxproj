@@ -48,10 +48,9 @@
     <VcpkgTriplet Condition="'$(Platform)'=='Win32'">x86-windows</VcpkgTriplet>
   </PropertyGroup>
   <PropertyGroup>
-    <!-- v1 is a hash-identification probe and never calls DLSS. Keep NGX off so the
-         package does not ship the 58 MB nvngx_dlss.dll (slow artifact downloads).
-         Turn this back on for v2, when the TAA resolve is actually replaced by DLAA. -->
-    <UseLumaNGX>false</UseLumaNGX>
+    <!-- v2 stage 2 wires DLAA into the TAA resolve, so the NGX code paths must be compiled in.
+         The full ZIP ships nvngx_dlss.dll again; use the Addon-only-ETS2 artifact to iterate. -->
+    <UseLumaNGX>true</UseLumaNGX>
     <!-- Packaging defaults to off; enable via Project Properties -> Luma Properties -> Package after build. -->
     <LumaPackage>false</LumaPackage>
   </PropertyGroup>

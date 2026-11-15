@@ -57,6 +57,7 @@
 static constexpr uint32_t kTaaResolvePS = 0x805A8981u;
 // LoadConfigs() has no DeviceData, so ini values are staged here and copied in OnCreateDevice().
 static int g_cancel_taa_resolve_ini = 0;
+static int g_enable_dlaa_ini = 0;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -65,7 +66,152 @@ struct ETS2DeviceData final : public GameDeviceData
    uint32_t frame_index = 0;
    bool enable_dlaa = false;        // v2 stage 2: real DLAA, still off
    bool cancel_taa_resolve = false; // v2 stage 1 debug toggle
+#if ENABLE_SR
+   com_ptr<ID3D11Texture2D> zero_mv;     // placeholder: all-zero float2 motion
+   com_ptr<ID3D11Texture2D> const_depth; // placeholder: constant HW depth
+   com_ptr<ID3D11Texture2D> uav_output;  // proxy when RTV0 lacks UAV
+   uint32_t sr_draws = 0;
+   uint32_t sr_failures = 0;
+   const char* sr_status = "off";
+#endif
 };
+
+#if ENABLE_SR
+// Stage 2 link validation. ETS2 has no standalone float motion vector buffer:
+// #6127 packs neighbour min/max depth into R16G16_UINT. Until that is decoded,
+// feed DLAA zero motion + a constant depth. Every failure path returns false so
+// the engine keeps its own TAA; this function never leaves the frame broken.
+static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data, ETS2DeviceData& gd)
+{
+   if (device_data.sr_type == SR::Type::None || device_data.sr_suppressed || device_data.has_drawn_sr)
+      return false;
+   auto* instance = device_data.GetSRInstanceData();
+   auto* impl = sr_implementations.count(device_data.sr_type) ? sr_implementations[device_data.sr_type].get() : nullptr;
+   if (!instance || !impl)
+   {
+      gd.sr_status = "no SR instance (pick DLSS in the Luma menu)";
+      return false;
+   }
+
+   com_ptr<ID3D11ShaderResourceView> srvs[8] = {};
+   com_ptr<ID3D11RenderTargetView> rtv;
+   com_ptr<ID3D11DepthStencilView> dsv;
+   ctx->PSGetShaderResources(0, 8, &srvs[0]);
+   ctx->OMGetRenderTargets(1, &rtv, &dsv);
+   if (!srvs[0] || !rtv)
+   {
+      gd.sr_status = "missing SRV0 / RTV0";
+      return false;
+   }
+
+   com_ptr<ID3D11Resource> source_color;
+   com_ptr<ID3D11Resource> output_color;
+   com_ptr<ID3D11Resource> depth_resource;
+   srvs[0]->GetResource(&source_color);
+   rtv->GetResource(&output_color);
+   if (dsv)
+      dsv->GetResource(&depth_resource);
+   if (!source_color || !output_color)
+   {
+      gd.sr_status = "missing colour resources";
+      return false;
+   }
+
+   com_ptr<ID3D11Texture2D> output_tex;
+   if (FAILED(output_color->QueryInterface(&output_tex)) || !output_tex)
+   {
+      gd.sr_status = "output is not a 2D texture";
+      return false;
+   }
+   D3D11_TEXTURE2D_DESC out_desc = {};
+   output_tex->GetDesc(&out_desc);
+   const UINT w = out_desc.Width;
+   const UINT h = out_desc.Height;
+
+   if (!gd.zero_mv || !gd.const_depth)
+   {
+      D3D11_TEXTURE2D_DESC d = {};
+      d.Width = w;
+      d.Height = h;
+      d.MipLevels = 1;
+      d.ArraySize = 1;
+      d.SampleDesc.Count = 1;
+      d.Usage = D3D11_USAGE_DEFAULT;
+      d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      std::vector<uint16_t> zeros(static_cast<size_t>(w) * h * 4, 0);
+      D3D11_SUBRESOURCE_DATA init = {zeros.data(), w * 8, 0};
+      device->CreateTexture2D(&d, &init, &gd.zero_mv);
+      d.Format = DXGI_FORMAT_R32_FLOAT;
+      std::vector<float> ones(static_cast<size_t>(w) * h, 1.f);
+      init = {ones.data(), w * 4, 0};
+      device->CreateTexture2D(&d, &init, &gd.const_depth);
+   }
+   if (!gd.zero_mv || !gd.const_depth)
+   {
+      gd.sr_status = "placeholder texture alloc failed";
+      return false;
+   }
+
+   SR::SettingsData settings = {};
+   settings.output_width = w;
+   settings.output_height = h;
+   settings.render_width = w;
+   settings.render_height = h;
+   settings.hdr = true;             // ETS2 resolves in linear RGBA16F
+   settings.inverted_depth = false; // TODO: verify ETS2 depth direction
+   settings.mvs_jittered = false;
+   settings.auto_exposure = false;
+   settings.mvs_x_scale = 1.f;
+   settings.mvs_y_scale = 1.f;
+   settings.render_preset = dlss_render_preset;
+   if (!impl->UpdateSettings(instance, ctx, settings))
+   {
+      gd.sr_status = "UpdateSettings failed";
+      device_data.force_reset_sr = true;
+      return false;
+   }
+
+   ID3D11Resource* dlss_output = output_color.get();
+   bool need_copy = false;
+   if ((out_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
+   {
+      D3D11_TEXTURE2D_DESC uav_desc = out_desc;
+      uav_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+      gd.uav_output = nullptr;
+      if (FAILED(device->CreateTexture2D(&uav_desc, nullptr, &gd.uav_output)) || !gd.uav_output)
+      {
+         gd.sr_status = "UAV proxy alloc failed";
+         return false;
+      }
+      dlss_output = gd.uav_output.get();
+      need_copy = true;
+   }
+
+   SR::SuperResolutionImpl::DrawData draw = {};
+   draw.source_color = source_color.get();
+   draw.output_color = dlss_output;
+   draw.motion_vectors = gd.zero_mv.get();
+   draw.depth_buffer = depth_resource ? depth_resource.get() : gd.const_depth.get();
+   draw.render_width = w;
+   draw.render_height = h;
+   draw.jitter_x = 0.f; // TODO: read the real jitter from CB slot 0
+   draw.jitter_y = 0.f;
+   draw.reset = device_data.force_reset_sr;
+
+   if (!impl->Draw(instance, ctx, draw))
+   {
+      gd.sr_status = "Draw failed";
+      return false;
+   }
+   if (need_copy)
+      ctx->CopyResource(output_color.get(), dlss_output);
+
+   gd.sr_status = depth_resource ? "DLAA active (zero MV, real DSV)" : "DLAA active (zero MV, constant depth)";
+   device_data.has_drawn_sr = true;
+   return true;
+}
+#endif
 
 class ETS2Game final : public Game // Go view "Source/Core/includes/game.h" for all the overridable virtual functions
 {
@@ -122,7 +268,9 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new ETS2DeviceData;
-      static_cast<ETS2DeviceData*>(device_data.game)->cancel_taa_resolve = g_cancel_taa_resolve_ini != 0;
+      auto* gd = static_cast<ETS2DeviceData*>(device_data.game);
+      gd->cancel_taa_resolve = g_cancel_taa_resolve_ini != 0;
+      gd->enable_dlaa = g_enable_dlaa_ini != 0;
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -143,6 +291,17 @@ public:
          // stage 2 will have to cancel that one too.
          if (game_device_data.cancel_taa_resolve)
             return DrawOrDispatchOverrideType::Skip;
+#if ENABLE_SR
+         if (game_device_data.enable_dlaa)
+         {
+            if (TryDrawDLAA(native_device, native_device_context, device_data, game_device_data))
+            {
+               ++game_device_data.sr_draws;
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+            ++game_device_data.sr_failures;
+         }
+#endif
       }
 
       return DrawOrDispatchOverrideType::None;
@@ -163,6 +322,7 @@ public:
       reshade::get_config_value(runtime, NAME, "GameSetting01", cb_luma_global_settings.GameSettings.GameSetting01);
       reshade::get_config_value(runtime, NAME, "GameSetting02", cb_luma_global_settings.GameSettings.GameSetting02);
       reshade::get_config_value(runtime, NAME, "CancelTaaResolve", g_cancel_taa_resolve_ini);
+      reshade::get_config_value(runtime, NAME, "EnableDlaa", g_enable_dlaa_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -174,7 +334,16 @@ public:
       ImGui::Text("TAA resolve 0x805A8981 hits: %u (frame %u)", game_device_data.taa_resolve_hits, game_device_data.frame_index);
       if (game_device_data.frame_index > 0)
          ImGui::Text("hits/frame: %.2f", float(game_device_data.taa_resolve_hits) / float(game_device_data.frame_index));
-      ImGui::Text("DLAA: off (stage 2)");
+#if ENABLE_SR
+      ImGui::Text("SR type: %d (DLSS = %d)", static_cast<int>(device_data.sr_type), static_cast<int>(SR::Type::DLSS));
+      if (ImGui::Checkbox("Enable DLAA (stage 2, placeholder MV/depth)", &game_device_data.enable_dlaa))
+      {
+         int value = game_device_data.enable_dlaa ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "EnableDlaa", value);
+      }
+      ImGui::Text("DLAA draws: %u  failures: %u", game_device_data.sr_draws, game_device_data.sr_failures);
+      ImGui::Text("status: %s", game_device_data.sr_status);
+#endif
       if (ImGui::Checkbox("Cancel TAA resolve (debug)", &game_device_data.cancel_taa_resolve))
       {
          int value = game_device_data.cancel_taa_resolve ? 1 : 0;
@@ -218,7 +387,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       uint32_t mod_version = 1; // Increase this to reset the game settings and shader binaries after making large changes to your mod
                                 // NOTE: the website argument must never be nullptr; SetGlobals() copies it with
       // strncpy() (globals.h), and a null source crashes DllMain with error 1114.
-      Globals::SetGlobals(cleared_project_name, "ETS2 DLAA v2 stage 1", "", mod_version);
+      Globals::SetGlobals(cleared_project_name, "ETS2 DLAA v2 stage 2", "", mod_version);
 
       // The following can be toggled in the dev settings (it generally only fully applies after changing the game's resolution).
       // Default these to "false" for the mod to not do "anything" that might cause issues with the game by default.

@@ -207,6 +207,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       swapchain_format_upgrade_type = TextureFormatUpgradesType::None;
       swapchain_upgrade_type = SwapchainUpgradeType::None;
       texture_format_upgrades_type = TextureFormatUpgradesType::None;
+      // Critical for a DLAA-only mod: core.hpp:5219 otherwise runs its
+      // "Display Composition" pass whenever gamma correction / re-encoding /
+      // gamut mapping is deemed necessary, which re-grades the whole image.
+      // ETS2 already outputs native BT.2100 PQ, so leave its colour untouched.
+      // This is the same setting Mafia Definitive Edition (DLAA only) uses.
+      force_disable_display_composition = true;
       // Texture upgrades (8 bit unorm and 11 bit float etc to 16 bit float)
       texture_upgrade_formats = {
          reshade::api::format::r8g8b8a8_unorm,

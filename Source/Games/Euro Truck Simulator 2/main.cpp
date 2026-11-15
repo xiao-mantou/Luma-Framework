@@ -59,6 +59,8 @@ static constexpr uint32_t kTaaResolvePS = 0x805A8981u;
 static int g_cancel_taa_resolve_ini = 0;
 static int g_enable_dlaa_ini = 0;
 static int g_test_output_path_ini = 0;
+static int g_bypass_ngx_ini = 0;
+static int g_source_slot_ini = -1; // -1 = auto (pick first RGBA16F SRV that is not RTV0)
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -70,9 +72,14 @@ struct ETS2DeviceData final : public GameDeviceData
    bool dlaa_drew_this_frame = false; // reset every OnPresent; do NOT use core's has_drawn_sr
    bool test_output_path = false;     // debug: copy a solid red texture instead of running DLSS
 #if ENABLE_SR
-   com_ptr<ID3D11Texture2D> zero_mv;     // placeholder: all-zero float2 motion
-   com_ptr<ID3D11Texture2D> const_depth; // placeholder: constant HW depth
-   com_ptr<ID3D11Texture2D> uav_output;  // proxy when RTV0 lacks UAV
+   bool bypass_ngx = false; // debug: copy the colour SRV straight into RTV0
+   int source_slot = -1;    // -1 = auto
+   int resolved_source_slot = 0;
+   bool source_equals_output = false;       // true => NGX would read back its own output
+   com_ptr<ID3D11Texture2D> zero_mv;        // placeholder: all-zero float2 motion
+   com_ptr<ID3D11Texture2D> const_depth;    // placeholder: constant HW depth
+   com_ptr<ID3D11Texture2D> uav_output;     // proxy when RTV0 lacks UAV
+   com_ptr<ID3D11Texture2D> staging_source; // snapshot when source == output
    uint32_t sr_draws = 0;
    uint32_t sr_failures = 0;
    const char* sr_status = "off";
@@ -123,23 +130,73 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    com_ptr<ID3D11DepthStencilView> dsv;
    ctx->PSGetShaderResources(0, 8, &srvs[0]);
    ctx->OMGetRenderTargets(1, &rtv, &dsv);
-   if (!srvs[0] || !rtv)
+
+   com_ptr<ID3D11Resource> output_color;
+   if (rtv)
+      rtv->GetResource(&output_color);
+   if (!output_color)
    {
-      SetSrStatus(gd, "missing SRV0 / RTV0");
+      SetSrStatus(gd, "missing RTV0");
       return false;
    }
 
-   com_ptr<ID3D11Resource> source_color;
-   com_ptr<ID3D11Resource> output_color;
+   // One-shot audit of every PS SRV slot. #6128 writes RTV0 (A15EA0), which is
+   // also consumed as the next frame's history. If the colour input resolves to
+   // that same resource, DLSS reads back its own output -> feedback black frame.
+   com_ptr<ID3D11Resource> srv_res[8] = {};
+   DXGI_FORMAT srv_fmt[8] = {};
+   bool srv_same[8] = {};
+   for (int i = 0; i < 8; ++i)
+   {
+      srv_fmt[i] = DXGI_FORMAT_UNKNOWN;
+      if (!srvs[i])
+         continue;
+      D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
+      srvs[i]->GetDesc(&vd);
+      srv_fmt[i] = vd.Format;
+      srvs[i]->GetResource(&srv_res[i]);
+      srv_same[i] = srv_res[i] && srv_res[i].get() == output_color.get();
+   }
+
+   int slot = gd.source_slot;
+   if (slot < 0 || slot > 7)
+   {
+      slot = 0;
+      for (int i = 0; i < 8; ++i)
+      {
+         if (srv_res[i] && !srv_same[i] && srv_fmt[i] == DXGI_FORMAT_R16G16B16A16_FLOAT)
+         {
+            slot = i;
+            break;
+         }
+      }
+   }
+   gd.resolved_source_slot = slot;
+   if (!srvs[slot] || !srv_res[slot])
+   {
+      SetSrStatus(gd, "missing colour SRV");
+      return false;
+   }
+
+   com_ptr<ID3D11Resource>& source_color = srv_res[slot];
    com_ptr<ID3D11Resource> depth_resource;
-   srvs[0]->GetResource(&source_color);
-   rtv->GetResource(&output_color);
    if (dsv)
       dsv->GetResource(&depth_resource);
-   if (!source_color || !output_color)
+   const bool same_resource = srv_same[slot];
+   gd.source_equals_output = same_resource;
+
+   static bool logged_bindings = false;
+   if (!logged_bindings)
    {
-      SetSrStatus(gd, "missing colour resources");
-      return false;
+      logged_bindings = true;
+      std::string line = "[ETS2 DLAA] bindings out=" +
+                         std::to_string(reinterpret_cast<unsigned long long>(output_color.get())) +
+                         " slot=" + std::to_string(slot);
+      for (int i = 0; i < 8; ++i)
+         line += " | s" + std::to_string(i) + "=" +
+                 std::to_string(reinterpret_cast<unsigned long long>(srv_res[i].get())) +
+                 " fmt=" + std::to_string(static_cast<int>(srv_fmt[i])) + (srv_same[i] ? " SAME" : "");
+      reshade::log::message(reshade::log::level::warning, line.c_str());
    }
 
    com_ptr<ID3D11Texture2D> output_tex;
@@ -182,6 +239,23 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       }
       SetSrStatus(gd, "output path test: texture alloc failed");
       return false;
+   }
+
+   // Debug: bypass NGX entirely and push the selected colour SRV through the
+   // exact same unbind/Copy/restore chain. A clean frame here proves the output
+   // path and every binding are fine, so a black DLAA frame is NGX-side.
+   if (gd.bypass_ngx)
+   {
+      ID3D11RenderTargetView* saved_rtv = rtv.get();
+      ID3D11DepthStencilView* saved_dsv = dsv.get();
+      ID3D11RenderTargetView* null_rtv = nullptr;
+      ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+      if (!same_resource)
+         ctx->CopyResource(output_color.get(), source_color.get());
+      ctx->OMSetRenderTargets(1, &saved_rtv, saved_dsv);
+      SetSrStatus(gd, same_resource ? "bypass NGX: source IS output (no copy)" : "bypass NGX: colour SRV copied to RTV0");
+      gd.dlaa_drew_this_frame = true;
+      return true;
    }
 
    if (!gd.zero_mv || !gd.const_depth)
@@ -258,8 +332,23 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       reshade::log::message(reshade::log::level::warning, branch.c_str());
    }
 
+   // Never let NGX read the very resource it is about to overwrite.
+   ID3D11Resource* dlss_source = source_color.get();
+   if (same_resource)
+   {
+      if (!gd.staging_source)
+      {
+         // Keep size/format/mip identical to RTV0 so CopyResource stays legal.
+         D3D11_TEXTURE2D_DESC sdesc = out_desc;
+         sdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+         device->CreateTexture2D(&sdesc, nullptr, &gd.staging_source);
+      }
+      if (gd.staging_source)
+         dlss_source = gd.staging_source.get();
+   }
+
    SR::SuperResolutionImpl::DrawData draw = {};
-   draw.source_color = source_color.get();
+   draw.source_color = dlss_source;
    draw.output_color = dlss_output;
    draw.motion_vectors = gd.zero_mv.get();
    draw.depth_buffer = depth_resource ? depth_resource.get() : gd.const_depth.get();
@@ -277,10 +366,37 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    ID3D11RenderTargetView* null_rtv = nullptr;
    ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
 
+   if (same_resource && gd.staging_source)
+      ctx->CopyResource(gd.staging_source.get(), source_color.get());
+
    const bool draw_ok = impl->Draw(instance, ctx, draw);
+
+   // DLSS is a compute pass and can leave its output UAV bound on return. A
+   // resource still bound as UAV is not a valid CopyResource source on some
+   // drivers, which would silently drop the copy (black frame). Detach the CS
+   // UAVs for the copy and restore them afterwards.
+   com_ptr<ID3D11UnorderedAccessView> bound_uavs[8] = {};
+   ctx->CSGetUnorderedAccessViews(0, 8, &bound_uavs[0]);
+   uint32_t bound_uav_count = 0;
+   for (int i = 0; i < 8; ++i)
+      bound_uav_count += bound_uavs[i] ? 1u : 0u;
+   static bool logged_uav = false;
+   if (!logged_uav)
+   {
+      logged_uav = true;
+      reshade::log::message(reshade::log::level::warning,
+         ("[ETS2 DLAA] cs_uavs_after_draw=" + std::to_string(bound_uav_count)).c_str());
+   }
+   ID3D11UnorderedAccessView* null_uavs[8] = {};
+   ctx->CSSetUnorderedAccessViews(0, 8, null_uavs, nullptr);
+
    if (draw_ok && need_copy)
       ctx->CopyResource(output_color.get(), dlss_output);
 
+   ID3D11UnorderedAccessView* restore_uavs[8] = {};
+   for (int i = 0; i < 8; ++i)
+      restore_uavs[i] = bound_uavs[i].get();
+   ctx->CSSetUnorderedAccessViews(0, 8, restore_uavs, nullptr);
    ctx->OMSetRenderTargets(1, &saved_rtv, saved_dsv);
 
    if (!draw_ok)
@@ -354,6 +470,10 @@ public:
       gd->cancel_taa_resolve = g_cancel_taa_resolve_ini != 0;
       gd->enable_dlaa = g_enable_dlaa_ini != 0;
       gd->test_output_path = g_test_output_path_ini != 0;
+#if ENABLE_SR
+      gd->bypass_ngx = g_bypass_ngx_ini != 0;
+      gd->source_slot = g_source_slot_ini;
+#endif
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -408,6 +528,8 @@ public:
       reshade::get_config_value(runtime, NAME, "CancelTaaResolve", g_cancel_taa_resolve_ini);
       reshade::get_config_value(runtime, NAME, "EnableDlaa", g_enable_dlaa_ini);
       reshade::get_config_value(runtime, NAME, "TestOutputPath", g_test_output_path_ini);
+      reshade::get_config_value(runtime, NAME, "BypassNgx", g_bypass_ngx_ini);
+      reshade::get_config_value(runtime, NAME, "SourceSlot", g_source_slot_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -433,6 +555,14 @@ public:
          int value = game_device_data.test_output_path ? 1 : 0;
          reshade::set_config_value(runtime, NAME, "TestOutputPath", value);
       }
+      if (ImGui::Checkbox("Bypass NGX (copy colour SRV to RTV0)", &game_device_data.bypass_ngx))
+      {
+         int value = game_device_data.bypass_ngx ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "BypassNgx", value);
+      }
+      if (ImGui::SliderInt("Colour SRV slot (-1=auto)", &game_device_data.source_slot, -1, 7))
+         reshade::set_config_value(runtime, NAME, "SourceSlot", game_device_data.source_slot);
+      ImGui::Text("resolved slot=%d source==output=%d", game_device_data.resolved_source_slot, game_device_data.source_equals_output ? 1 : 0);
       ImGui::Text("sr_suppressed=%d core_has_drawn_sr=%d dlaa_this_frame=%d", device_data.sr_suppressed ? 1 : 0, device_data.has_drawn_sr ? 1 : 0, game_device_data.dlaa_drew_this_frame ? 1 : 0);
       ImGui::Text("Select 'DLSS' in the Super Resolution combo above first.");
 #endif

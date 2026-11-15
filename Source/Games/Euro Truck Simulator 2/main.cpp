@@ -64,8 +64,9 @@ struct ETS2DeviceData final : public GameDeviceData
    bool has_drawn_taa_resolve = false;
    uint32_t taa_resolve_hits = 0; // cumulative, shown in the ImGui panel
    uint32_t frame_index = 0;
-   bool enable_dlaa = false;        // v2 stage 2: real DLAA, still off
-   bool cancel_taa_resolve = false; // v2 stage 1 debug toggle
+   bool enable_dlaa = false;          // v2 stage 2: real DLAA, still off
+   bool cancel_taa_resolve = false;   // v2 stage 1 debug toggle
+   bool dlaa_drew_this_frame = false; // reset every OnPresent; do NOT use core's has_drawn_sr
 #if ENABLE_SR
    com_ptr<ID3D11Texture2D> zero_mv;     // placeholder: all-zero float2 motion
    com_ptr<ID3D11Texture2D> const_depth; // placeholder: constant HW depth
@@ -102,9 +103,9 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       SetSrStatus(gd, "SR suppressed by core");
       return false;
    }
-   if (device_data.has_drawn_sr)
+   if (gd.dlaa_drew_this_frame)
    {
-      SetSrStatus(gd, "SR already drew this frame");
+      SetSrStatus(gd, "DLAA already drew this frame (duplicate resolve)");
       return false;
    }
    auto* instance = device_data.GetSRInstanceData();
@@ -230,7 +231,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       ctx->CopyResource(output_color.get(), dlss_output);
 
    SetSrStatus(gd, depth_resource ? "DLAA active (zero MV, real DSV)" : "DLAA active (zero MV, constant depth)");
-   device_data.has_drawn_sr = true;
+   gd.dlaa_drew_this_frame = true;
    return true;
 }
 #endif
@@ -333,6 +334,7 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
 
       game_device_data.has_drawn_taa_resolve = false;
+      game_device_data.dlaa_drew_this_frame = false;
       ++game_device_data.frame_index;
    }
 
@@ -365,7 +367,7 @@ public:
       }
       ImGui::Text("DLAA draws: %u  failures: %u", game_device_data.sr_draws, game_device_data.sr_failures);
       ImGui::Text("status: %s", game_device_data.sr_status);
-      ImGui::Text("sr_suppressed=%d has_drawn_sr=%d", device_data.sr_suppressed ? 1 : 0, device_data.has_drawn_sr ? 1 : 0);
+      ImGui::Text("sr_suppressed=%d core_has_drawn_sr=%d dlaa_this_frame=%d", device_data.sr_suppressed ? 1 : 0, device_data.has_drawn_sr ? 1 : 0, game_device_data.dlaa_drew_this_frame ? 1 : 0);
       ImGui::Text("Select 'DLSS' in the Super Resolution combo above first.");
 #endif
       if (ImGui::Checkbox("Cancel TAA resolve (debug)", &game_device_data.cancel_taa_resolve))

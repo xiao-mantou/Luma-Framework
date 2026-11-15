@@ -58,6 +58,7 @@ static constexpr uint32_t kTaaResolvePS = 0x805A8981u;
 // LoadConfigs() has no DeviceData, so ini values are staged here and copied in OnCreateDevice().
 static int g_cancel_taa_resolve_ini = 0;
 static int g_enable_dlaa_ini = 0;
+static int g_test_output_path_ini = 0;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -67,6 +68,7 @@ struct ETS2DeviceData final : public GameDeviceData
    bool enable_dlaa = false;          // v2 stage 2: real DLAA, still off
    bool cancel_taa_resolve = false;   // v2 stage 1 debug toggle
    bool dlaa_drew_this_frame = false; // reset every OnPresent; do NOT use core's has_drawn_sr
+   bool test_output_path = false;     // debug: copy a solid red texture instead of running DLSS
 #if ENABLE_SR
    com_ptr<ID3D11Texture2D> zero_mv;     // placeholder: all-zero float2 motion
    com_ptr<ID3D11Texture2D> const_depth; // placeholder: constant HW depth
@@ -151,6 +153,37 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    const UINT w = out_desc.Width;
    const UINT h = out_desc.Height;
 
+   // Debug: prove the output path itself. If the screen turns solid red, the
+   // unbind/Copy/restore chain works and a black DLAA frame means NGX rejected
+   // the placeholder inputs. If it stays dark, CopyResource is the culprit and
+   // we need the Luma_Copy_PS full-screen pass instead.
+   if (gd.test_output_path)
+   {
+      D3D11_TEXTURE2D_DESC d = out_desc;
+      std::vector<uint16_t> pixels(static_cast<size_t>(w) * h * 4, 0);
+      for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i)
+      {
+         pixels[i * 4 + 0] = 0x3C00; // half-float 1.0 (red)
+         pixels[i * 4 + 3] = 0x3C00; // alpha
+      }
+      D3D11_SUBRESOURCE_DATA init = {pixels.data(), w * 8, 0};
+      com_ptr<ID3D11Texture2D> red;
+      if (SUCCEEDED(device->CreateTexture2D(&d, &init, &red)))
+      {
+         ID3D11RenderTargetView* saved_rtv = rtv.get();
+         ID3D11DepthStencilView* saved_dsv = dsv.get();
+         ID3D11RenderTargetView* null_rtv = nullptr;
+         ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+         ctx->CopyResource(output_color.get(), red.get());
+         ctx->OMSetRenderTargets(1, &saved_rtv, saved_dsv);
+         SetSrStatus(gd, "output path test: solid red");
+         gd.dlaa_drew_this_frame = true;
+         return true;
+      }
+      SetSrStatus(gd, "output path test: texture alloc failed");
+      return false;
+   }
+
    if (!gd.zero_mv || !gd.const_depth)
    {
       D3D11_TEXTURE2D_DESC d = {};
@@ -217,7 +250,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    {
       logged_branch = true;
       const std::string branch = "[ETS2 DLAA] branch need_copy=" + std::to_string(need_copy ? 1 : 0) +
-                                 " bind_flags=0x" + std::to_string(out_desc.BindFlags) +
+                                 " bind_flags=" + std::to_string(out_desc.BindFlags) +
                                  " has_uav=" + std::to_string((out_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0 ? 1 : 0) +
                                  " size=" + std::to_string(w) + "x" + std::to_string(h) +
                                  " format=" + std::to_string(static_cast<int>(out_desc.Format)) +
@@ -320,6 +353,7 @@ public:
       auto* gd = static_cast<ETS2DeviceData*>(device_data.game);
       gd->cancel_taa_resolve = g_cancel_taa_resolve_ini != 0;
       gd->enable_dlaa = g_enable_dlaa_ini != 0;
+      gd->test_output_path = g_test_output_path_ini != 0;
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -373,6 +407,7 @@ public:
       reshade::get_config_value(runtime, NAME, "GameSetting02", cb_luma_global_settings.GameSettings.GameSetting02);
       reshade::get_config_value(runtime, NAME, "CancelTaaResolve", g_cancel_taa_resolve_ini);
       reshade::get_config_value(runtime, NAME, "EnableDlaa", g_enable_dlaa_ini);
+      reshade::get_config_value(runtime, NAME, "TestOutputPath", g_test_output_path_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -393,6 +428,11 @@ public:
       }
       ImGui::Text("DLAA draws: %u  failures: %u", game_device_data.sr_draws, game_device_data.sr_failures);
       ImGui::Text("status: %s", game_device_data.sr_status);
+      if (ImGui::Checkbox("Test output path (solid red, skips DLSS)", &game_device_data.test_output_path))
+      {
+         int value = game_device_data.test_output_path ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "TestOutputPath", value);
+      }
       ImGui::Text("sr_suppressed=%d core_has_drawn_sr=%d dlaa_this_frame=%d", device_data.sr_suppressed ? 1 : 0, device_data.has_drawn_sr ? 1 : 0, game_device_data.dlaa_drew_this_frame ? 1 : 0);
       ImGui::Text("Select 'DLSS' in the Super Resolution combo above first.");
 #endif

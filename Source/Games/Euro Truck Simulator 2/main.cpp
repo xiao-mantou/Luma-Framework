@@ -66,6 +66,8 @@ static int g_bypass_ngx_ini = 0;
 static int g_source_slot_ini = -1; // -1 = auto (pick first RGBA16F SRV that is not RTV0)
 static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
+static int g_use_game_jitter_ini = 1;
+static int g_invert_jitter_ini = 0;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -87,6 +89,21 @@ struct ETS2DeviceData final : public GameDeviceData
    uint32_t stats_logs = 0;
    bool mark_dlaa_output = false; // debug: stamp a magenta block on our output
    uint32_t next_heartbeat_frame = 0;
+   bool use_game_jitter = true;
+   bool invert_jitter = false;
+   bool jitter_ok = false;
+   float jitter_uv_x = 0.f;
+   float jitter_uv_y = 0.f;
+   float jitter_px_x = 0.f;
+   float jitter_px_y = 0.f;
+   float last_jitter_x = 0.f;
+   float last_jitter_y = 0.f;
+   uint32_t jitter_first = 0;
+   uint32_t jitter_num = 0;
+   uint32_t jitter_cb_bytes = 0;
+   uint32_t jitter_changes = 0;
+   uint32_t next_jitter_log_frame = 0;
+   com_ptr<ID3D11Buffer> jitter_staging;
    com_ptr<ID3D11Texture2D> zero_mv;        // placeholder: all-zero float2 motion
    com_ptr<ID3D11Texture2D> const_depth;    // placeholder: constant HW depth
    com_ptr<ID3D11Texture2D> uav_output;     // proxy when RTV0 lacks UAV
@@ -225,6 +242,89 @@ static void ApplyDlaaMarker(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT 
    }
    const D3D11_BOX box = {0, 0, 0, mw, mh, 1};
    ctx->UpdateSubresource(res, 0, &box, marker.data(), mw * 8, 0);
+}
+
+// #6128 reads its per-frame jitter from cb0[8].xy (UV space). The engine
+// suballocates one big constant buffer, so the offset must be queried at
+// runtime: PSGetConstantBuffers1() returns pFirstConstant in float4 units.
+static bool ReadGameJitter(ID3D11Device* device, ID3D11DeviceContext* ctx, ETS2DeviceData& gd,
+   UINT w, UINT h, float& out_x, float& out_y)
+{
+   com_ptr<ID3D11DeviceContext1> ctx1;
+   if (FAILED(ctx->QueryInterface(&ctx1)) || !ctx1)
+      return false;
+   com_ptr<ID3D11Buffer> cb;
+   UINT first = 0;
+   UINT num = 0;
+   ctx1->PSGetConstantBuffers1(0, 1, &cb, &first, &num);
+   gd.jitter_first = first;
+   gd.jitter_num = num;
+   if (!cb)
+      return false;
+   D3D11_BUFFER_DESC bd = {};
+   cb->GetDesc(&bd);
+   gd.jitter_cb_bytes = bd.ByteWidth;
+   static bool logged_cb_info = false;
+   if (!logged_cb_info)
+   {
+      logged_cb_info = true;
+      const std::string msg = "[ETS2 DLAA] jitter_cb first=" + std::to_string(first) +
+                              " num=" + std::to_string(num) + " bytes=" + std::to_string(bd.ByteWidth);
+      reshade::log::message(reshade::log::level::warning, msg.c_str());
+   }
+
+   constexpr UINT kWindow = 256; // CB0 size reported by the DevKit capture
+   const UINT src_left = first * 16;
+   if (bd.ByteWidth < src_left + kWindow)
+      return false;
+   if (!gd.jitter_staging)
+   {
+      D3D11_BUFFER_DESC sd = {};
+      sd.ByteWidth = kWindow;
+      sd.Usage = D3D11_USAGE_STAGING;
+      sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      device->CreateBuffer(&sd, nullptr, &gd.jitter_staging);
+   }
+   if (!gd.jitter_staging)
+      return false;
+   const D3D11_BOX box = {src_left, 0, 0, src_left + kWindow, 1, 1};
+   ctx->CopySubresourceRegion(gd.jitter_staging.get(), 0, 0, 0, 0, cb.get(), 0, &box);
+   D3D11_MAPPED_SUBRESOURCE m = {};
+   if (FAILED(ctx->Map(gd.jitter_staging.get(), 0, D3D11_MAP_READ, 0, &m)))
+      return false;
+   const float* data = static_cast<const float*>(m.pData);
+   const float uv_x = data[8 * 4 + 0];
+   const float uv_y = data[8 * 4 + 1];
+   ctx->Unmap(gd.jitter_staging.get(), 0);
+
+   gd.jitter_uv_x = uv_x;
+   gd.jitter_uv_y = uv_y;
+   if (fabsf(uv_x - gd.last_jitter_x) > 1e-7f || fabsf(uv_y - gd.last_jitter_y) > 1e-7f)
+      ++gd.jitter_changes;
+   gd.last_jitter_x = uv_x;
+   gd.last_jitter_y = uv_y;
+
+   if (gd.frame_index >= gd.next_jitter_log_frame)
+   {
+      gd.next_jitter_log_frame = gd.frame_index + 60;
+      const std::string msg = "[ETS2 DLAA] jitter f=" + std::to_string(gd.frame_index) +
+                              " first=" + std::to_string(first) + " num=" + std::to_string(num) +
+                              " cb_bytes=" + std::to_string(bd.ByteWidth) +
+                              " uv=(" + std::to_string(uv_x) + "," + std::to_string(uv_y) + ")" +
+                              " px=(" + std::to_string(uv_x * w) + "," + std::to_string(uv_y * h) + ")" +
+                              " changes=" + std::to_string(gd.jitter_changes);
+      reshade::log::message(reshade::log::level::warning, msg.c_str());
+   }
+
+   // Reject implausible values so a wrong offset never feeds garbage to NGX.
+   if (fabsf(uv_x) > 0.5f || fabsf(uv_y) > 0.5f)
+      return false;
+   const float sign = gd.invert_jitter ? -1.f : 1.f;
+   out_x = sign * uv_x * static_cast<float>(w);
+   out_y = sign * uv_y * static_cast<float>(h);
+   gd.jitter_px_x = out_x;
+   gd.jitter_px_y = out_y;
+   return true;
 }
 
 static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data, ETS2DeviceData& gd)
@@ -518,8 +618,18 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    draw.depth_buffer = depth_resource ? depth_resource.get() : gd.const_depth.get();
    draw.render_width = w;
    draw.render_height = h;
-   draw.jitter_x = 0.f; // TODO: read the real jitter from CB slot 0
+   draw.jitter_x = 0.f;
    draw.jitter_y = 0.f;
+   gd.jitter_ok = false;
+   if (gd.use_game_jitter && ReadGameJitter(device, ctx, gd, w, h, draw.jitter_x, draw.jitter_y))
+      gd.jitter_ok = true;
+   static bool logged_jitter_fail = false;
+   if (gd.use_game_jitter && !gd.jitter_ok && !logged_jitter_fail)
+   {
+      logged_jitter_fail = true;
+      reshade::log::message(reshade::log::level::warning,
+         "[ETS2 DLAA] jitter: CB0 read failed, falling back to 0");
+   }
    draw.reset = device_data.force_reset_sr;
 
    // NGX writes through a UAV while the same resource is still bound as the
@@ -658,6 +768,8 @@ public:
       gd->source_slot = g_source_slot_ini;
       gd->keep_engine_resolve = g_keep_engine_resolve_ini != 0;
       gd->mark_dlaa_output = g_mark_dlaa_output_ini != 0;
+      gd->use_game_jitter = g_use_game_jitter_ini != 0;
+      gd->invert_jitter = g_invert_jitter_ini != 0;
 #endif
    }
 
@@ -742,6 +854,8 @@ public:
       reshade::get_config_value(runtime, NAME, "SourceSlot", g_source_slot_ini);
       reshade::get_config_value(runtime, NAME, "KeepEngineResolve", g_keep_engine_resolve_ini);
       reshade::get_config_value(runtime, NAME, "MarkDlaaOutput", g_mark_dlaa_output_ini);
+      reshade::get_config_value(runtime, NAME, "UseGameJitter", g_use_game_jitter_ini);
+      reshade::get_config_value(runtime, NAME, "InvertJitter", g_invert_jitter_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -778,6 +892,19 @@ public:
          reshade::set_config_value(runtime, NAME, "KeepEngineResolve", value);
       }
       ImGui::Text("original draw callback: %s", game_device_data.original_draw_available ? "available" : "MISSING");
+      if (ImGui::Checkbox("Use game jitter (CB0[8].xy)", &game_device_data.use_game_jitter))
+      {
+         int value = game_device_data.use_game_jitter ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "UseGameJitter", value);
+      }
+      if (ImGui::Checkbox("Invert jitter sign", &game_device_data.invert_jitter))
+      {
+         int value = game_device_data.invert_jitter ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "InvertJitter", value);
+      }
+      ImGui::Text("jitter uv=(%.6f,%.6f) px=(%.3f,%.3f) first=%u ok=%d", game_device_data.jitter_uv_x,
+         game_device_data.jitter_uv_y, game_device_data.jitter_px_x, game_device_data.jitter_px_y,
+         game_device_data.jitter_first, game_device_data.jitter_ok ? 1 : 0);
       if (ImGui::Checkbox("Mark our output (magenta block, proves overwrite)", &game_device_data.mark_dlaa_output))
       {
          int value = game_device_data.mark_dlaa_output ? 1 : 0;

@@ -90,6 +90,8 @@ struct ETS2DeviceData final : public GameDeviceData
    bool original_draw_available = false;
    uint32_t next_stats_frame = 0;
    uint32_t stats_logs = 0;
+   uint32_t next_mv_stats_frame = 0;
+   uint32_t mv_stats_logs = 0;
    bool mark_dlaa_output = false; // debug: stamp a magenta block on our output
    uint32_t next_heartbeat_frame = 0;
    bool use_game_jitter = true;
@@ -246,6 +248,89 @@ static std::string StatsText(const TexStats& st)
    char buf[128];
    sprintf_s(buf, "mean=%.3f max=%.3f nz=%.2f", st.mean, st.max, st.nonzero);
    return buf;
+}
+
+struct MvStats
+{
+   float top_mean = 0.f;
+   float top_max = 0.f;
+   float top_nz = 0.f;
+   float btm_mean = 0.f;
+   float btm_max = 0.f;
+   float btm_nz = 0.f;
+   bool ok = false;
+};
+
+// Samples a 32x32 grid across R16G16_FLOAT motion vectors and splits into top/bottom halves.
+static MvStats ReadMvStats(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11Resource* res)
+{
+   MvStats st;
+   if (!res)
+      return st;
+   com_ptr<ID3D11Texture2D> tex;
+   if (FAILED(res->QueryInterface(&tex)) || !tex)
+      return st;
+   D3D11_TEXTURE2D_DESC d = {};
+   tex->GetDesc(&d);
+   if (d.Format != DXGI_FORMAT_R16G16_FLOAT || d.SampleDesc.Count != 1)
+      return st;
+   D3D11_TEXTURE2D_DESC sd = d;
+   sd.Usage = D3D11_USAGE_STAGING;
+   sd.BindFlags = 0;
+   sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+   sd.MiscFlags = 0;
+   com_ptr<ID3D11Texture2D> staging;
+   if (FAILED(device->CreateTexture2D(&sd, nullptr, &staging)) || !staging)
+      return st;
+   ctx->CopyResource(staging.get(), res);
+   D3D11_MAPPED_SUBRESOURCE m = {};
+   if (FAILED(ctx->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m)))
+      return st;
+   const UINT step_x = d.Width > 32 ? d.Width / 32 : 1;
+   const UINT step_y = d.Height > 32 ? d.Height / 32 : 1;
+   double top_sum = 0.0, btm_sum = 0.0;
+   float top_mx = 0.f, btm_mx = 0.f;
+   uint32_t top_n = 0, btm_n = 0;
+   uint32_t top_nz = 0, btm_nz = 0;
+   const UINT mid_y = d.Height / 2;
+   for (UINT y = 0; y < d.Height; y += step_y)
+   {
+      const uint16_t* row = reinterpret_cast<const uint16_t*>(static_cast<const char*>(m.pData) + static_cast<size_t>(y) * m.RowPitch);
+      const bool is_top = (y < mid_y);
+      for (UINT x = 0; x < d.Width; x += step_x)
+      {
+         const float u = HalfToFloat(row[x * 2 + 0]);
+         const float v = HalfToFloat(row[x * 2 + 1]);
+         const float mag = sqrtf(u * u + v * v);
+         if (is_top)
+         {
+            top_sum += mag;
+            if (mag > top_mx)
+               top_mx = mag;
+            if (mag > 1e-5f)
+               ++top_nz;
+            ++top_n;
+         }
+         else
+         {
+            btm_sum += mag;
+            if (mag > btm_mx)
+               btm_mx = mag;
+            if (mag > 1e-5f)
+               ++btm_nz;
+            ++btm_n;
+         }
+      }
+   }
+   ctx->Unmap(staging.get(), 0);
+   st.top_mean = top_n ? static_cast<float>(top_sum / top_n) : 0.f;
+   st.top_max = top_mx;
+   st.top_nz = top_n ? static_cast<float>(top_nz) / top_n : 0.f;
+   st.btm_mean = btm_n ? static_cast<float>(btm_sum / btm_n) : 0.f;
+   st.btm_max = btm_mx;
+   st.btm_nz = btm_n ? static_cast<float>(btm_nz) / btm_n : 0.f;
+   st.ok = true;
+   return st;
 }
 
 // Stamps a 128x128 magenta block into the top-left of the resource we are
@@ -471,6 +556,26 @@ static bool ReadGameJitter(ID3D11Device* device, ID3D11DeviceContext* ctx, ETS2D
    gd.game_cb0_valid = true;
    const float uv_x = data[8 * 4 + 0];
    const float uv_y = data[8 * 4 + 1];
+
+   static bool cb0_dumped = false;
+   if (!cb0_dumped)
+   {
+      cb0_dumped = true;
+      for (int i = 0; i < 16; ++i)
+      {
+         char buf[256];
+         sprintf_s(buf, "[ETS2 DLAA] cb0[%02d] = (%12.6f, %12.6f, %12.6f, %12.6f)",
+            i, data[i * 4 + 0], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]);
+         reshade::log::message(reshade::log::level::warning, buf);
+      }
+      const float rz_x = data[11 * 4 + 0] / (fabsf(data[11 * 4 + 2]) > 1e-6f ? data[11 * 4 + 2] : 1.f);
+      const float rz_y = data[11 * 4 + 1] / (fabsf(data[11 * 4 + 3]) > 1e-6f ? data[11 * 4 + 3] : 1.f);
+      char buf_rz[256];
+      sprintf_s(buf_rz, "[ETS2 DLAA] cb0 render_size=(%.2f, %.2f) target=(%u, %u) cb0_10=(%.6f, %.6f, %.6f, %.6f)",
+         rz_x, rz_y, w, h, data[10 * 4 + 0], data[10 * 4 + 1], data[10 * 4 + 2], data[10 * 4 + 3]);
+      reshade::log::message(reshade::log::level::warning, buf_rz);
+   }
+
    ctx->Unmap(gd.jitter_staging.get(), 0);
 
    gd.jitter_uv_x = uv_x;
@@ -875,6 +980,21 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    gd.jitter_ok = ReadGameJitter(device, ctx, gd, w, h, game_jitter_x, game_jitter_y);
    if (srvs[4])
       BuildMotionVectors(device, ctx, device_data, gd, srvs[4].get(), w, h);
+
+   if (gd.mv_ready && gd.frame_index >= gd.next_mv_stats_frame && gd.mv_stats_logs < 8)
+   {
+      gd.next_mv_stats_frame = gd.frame_index + 60;
+      ++gd.mv_stats_logs;
+      const MvStats ms = ReadMvStats(device, ctx, gd.mv_texture.get());
+      if (ms.ok)
+      {
+         char buf[384];
+         sprintf_s(buf, "[ETS2 DLAA] mv_stats f=%u top [uv_mean=%.6f max=%.6f px_mean=%.2f max=%.2f nz=%.2f] btm [uv_mean=%.6f max=%.6f px_mean=%.2f max=%.2f nz=%.2f]",
+            gd.frame_index, ms.top_mean, ms.top_max, ms.top_mean * w, ms.top_max * w, ms.top_nz,
+            ms.btm_mean, ms.btm_max, ms.btm_mean * w, ms.btm_max * w, ms.btm_nz);
+         reshade::log::message(reshade::log::level::warning, buf);
+      }
+   }
 
    SR::SuperResolutionImpl::DrawData draw = {};
    draw.source_color = dlss_source;

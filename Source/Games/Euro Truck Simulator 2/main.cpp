@@ -100,6 +100,100 @@ static void SetSrStatus(ETS2DeviceData& gd, const char* status)
    reshade::log::message(reshade::log::level::warning, message.c_str());
 }
 
+static float HalfToFloat(uint16_t h)
+{
+   const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+   const uint32_t exp = (h >> 10) & 0x1Fu;
+   const uint32_t mant = h & 0x03FFu;
+   uint32_t bits;
+   if (exp == 0)
+      bits = sign; // subnormals are irrelevant for luminance statistics
+   else if (exp == 31)
+      bits = sign | 0x7F800000u | (mant << 13);
+   else
+      bits = sign | ((exp + 112u) << 23) | (mant << 13);
+   union
+   {
+      uint32_t u;
+      float f;
+   } v = {bits};
+   return v.f;
+}
+
+struct TexStats
+{
+   float mean = 0.f;
+   float max = 0.f;
+   float nonzero = 0.f;
+   bool ok = false;
+};
+
+// One-shot CPU readback of a RGBA16F resource. Samples a 32x32 grid so this
+// never stalls the frame for long.
+static TexStats ReadTexStats(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11Resource* res)
+{
+   TexStats st;
+   if (!res)
+      return st;
+   com_ptr<ID3D11Texture2D> tex;
+   if (FAILED(res->QueryInterface(&tex)) || !tex)
+      return st;
+   D3D11_TEXTURE2D_DESC d = {};
+   tex->GetDesc(&d);
+   if (d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || d.SampleDesc.Count != 1)
+      return st;
+   D3D11_TEXTURE2D_DESC sd = d;
+   sd.Usage = D3D11_USAGE_STAGING;
+   sd.BindFlags = 0;
+   sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+   sd.MiscFlags = 0;
+   com_ptr<ID3D11Texture2D> staging;
+   if (FAILED(device->CreateTexture2D(&sd, nullptr, &staging)) || !staging)
+      return st;
+   ctx->CopyResource(staging.get(), res);
+   D3D11_MAPPED_SUBRESOURCE m = {};
+   if (FAILED(ctx->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m)))
+      return st;
+   const UINT step_x = d.Width > 32 ? d.Width / 32 : 1;
+   const UINT step_y = d.Height > 32 ? d.Height / 32 : 1;
+   double sum = 0.0;
+   float mx = 0.f;
+   uint32_t n = 0;
+   uint32_t nz = 0;
+   for (UINT y = 0; y < d.Height; y += step_y)
+   {
+      const uint16_t* row = reinterpret_cast<const uint16_t*>(static_cast<const char*>(m.pData) + static_cast<size_t>(y) * m.RowPitch);
+      for (UINT x = 0; x < d.Width; x += step_x)
+      {
+         const float r = HalfToFloat(row[x * 4 + 0]);
+         const float g = HalfToFloat(row[x * 4 + 1]);
+         const float b = HalfToFloat(row[x * 4 + 2]);
+         const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+         sum += lum;
+         if (lum > mx)
+            mx = lum;
+         if (lum > 0.001f)
+            ++nz;
+         ++n;
+      }
+   }
+   ctx->Unmap(staging.get(), 0);
+   st.mean = n ? static_cast<float>(sum / n) : 0.f;
+   st.max = mx;
+   st.nonzero = n ? static_cast<float>(nz) / n : 0.f;
+   st.ok = true;
+   return st;
+}
+
+static std::string StatsText(const TexStats& st)
+{
+   if (!st.ok)
+      return "n/a";
+   char buf[128];
+   sprintf_s(buf, "mean=%.3f max=%.3f nz=%.2f", st.mean, st.max, st.nonzero);
+   return buf;
+}
+
 static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data, ETS2DeviceData& gd)
 {
    if (device_data.sr_type == SR::Type::None)
@@ -199,6 +293,23 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       reshade::log::message(reshade::log::level::warning, line.c_str());
    }
 
+   // One-shot readback: which SRV actually carries the current frame colour?
+   static bool logged_stats = false;
+   if (!logged_stats)
+   {
+      logged_stats = true;
+      std::string stats = "[ETS2 DLAA] srv_stats";
+      for (int i = 0; i < 8; ++i)
+      {
+         if (!srv_res[i] || srv_fmt[i] != DXGI_FORMAT_R16G16B16A16_FLOAT)
+            continue;
+         stats += " s" + std::to_string(i) + " [" + StatsText(ReadTexStats(device, ctx, srv_res[i].get())) + "]";
+      }
+      // RTV0 is still bound to the OM here, so it is not a legal readback source.
+      // Its contents are verified after the copy, once the OM has been detached.
+      reshade::log::message(reshade::log::level::warning, stats.c_str());
+   }
+
    com_ptr<ID3D11Texture2D> output_tex;
    if (FAILED(output_color->QueryInterface(&output_tex)) || !output_tex)
    {
@@ -249,9 +360,27 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       ID3D11RenderTargetView* saved_rtv = rtv.get();
       ID3D11DepthStencilView* saved_dsv = dsv.get();
       ID3D11RenderTargetView* null_rtv = nullptr;
+      // An SRV bound to the PS may keep the resource alive in a state where the
+      // driver drops the copy. Detach all PS SRVs for the copy, then restore.
+      com_ptr<ID3D11ShaderResourceView> saved_ps_srvs[16] = {};
+      ctx->PSGetShaderResources(0, 16, &saved_ps_srvs[0]);
+      ID3D11ShaderResourceView* null_srvs[16] = {};
+      ctx->PSSetShaderResources(0, 16, null_srvs);
       ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
       if (!same_resource)
          ctx->CopyResource(output_color.get(), source_color.get());
+      static bool logged_bypass_copy = false;
+      if (!logged_bypass_copy)
+      {
+         logged_bypass_copy = true;
+         const std::string msg = "[ETS2 DLAA] bypass_copy src [" + StatsText(ReadTexStats(device, ctx, source_color.get())) +
+                                 "] dst [" + StatsText(ReadTexStats(device, ctx, output_color.get())) + "]";
+         reshade::log::message(reshade::log::level::warning, msg.c_str());
+      }
+      ID3D11ShaderResourceView* restore_srvs[16] = {};
+      for (int i = 0; i < 16; ++i)
+         restore_srvs[i] = saved_ps_srvs[i].get();
+      ctx->PSSetShaderResources(0, 16, restore_srvs);
       ctx->OMSetRenderTargets(1, &saved_rtv, saved_dsv);
       SetSrStatus(gd, same_resource ? "bypass NGX: source IS output (no copy)" : "bypass NGX: colour SRV copied to RTV0");
       gd.dlaa_drew_this_frame = true;
@@ -389,15 +518,32 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    }
    ID3D11UnorderedAccessView* null_uavs[8] = {};
    ctx->CSSetUnorderedAccessViews(0, 8, null_uavs, nullptr);
+   com_ptr<ID3D11ShaderResourceView> saved_ps_srvs[16] = {};
+   ctx->PSGetShaderResources(0, 16, &saved_ps_srvs[0]);
+   ID3D11ShaderResourceView* null_srvs[16] = {};
+   ctx->PSSetShaderResources(0, 16, null_srvs);
 
    if (draw_ok && need_copy)
       ctx->CopyResource(output_color.get(), dlss_output);
 
+   ID3D11ShaderResourceView* restore_srvs[16] = {};
+   for (int i = 0; i < 16; ++i)
+      restore_srvs[i] = saved_ps_srvs[i].get();
+   ctx->PSSetShaderResources(0, 16, restore_srvs);
    ID3D11UnorderedAccessView* restore_uavs[8] = {};
    for (int i = 0; i < 8; ++i)
       restore_uavs[i] = bound_uavs[i].get();
    ctx->CSSetUnorderedAccessViews(0, 8, restore_uavs, nullptr);
    ctx->OMSetRenderTargets(1, &saved_rtv, saved_dsv);
+
+   static bool logged_dlss_copy = false;
+   if (!logged_dlss_copy)
+   {
+      logged_dlss_copy = true;
+      const std::string msg = "[ETS2 DLAA] dlss_copy out [" + StatsText(ReadTexStats(device, ctx, output_color.get())) +
+                              "] uav [" + StatsText(ReadTexStats(device, ctx, dlss_output)) + "]";
+      reshade::log::message(reshade::log::level::warning, msg.c_str());
+   }
 
    if (!draw_ok)
    {

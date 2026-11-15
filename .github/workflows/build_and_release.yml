@@ -276,7 +276,9 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Addon-only-ETS2
-        path: Binaries/${{ matrix.platform }}-${{ matrix.config }}/Luma-*.addon
+        path: |
+          Binaries/${{ matrix.platform }}-${{ matrix.config }}/Luma-*.addon
+          Shaders/Euro Truck Simulator 2/Luma_ETS2_MotionVectors.hlsl
         compression-level: 0
 
   release:

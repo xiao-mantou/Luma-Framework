@@ -68,6 +68,9 @@ static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
 static int g_use_game_jitter_ini = 1;
 static int g_invert_jitter_ini = 0;
+static float g_mvs_x_scale_ini = 1920.f;
+static float g_mvs_y_scale_ini = 1080.f;
+static int g_mvs_jittered_ini = 0;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -104,6 +107,16 @@ struct ETS2DeviceData final : public GameDeviceData
    uint32_t jitter_changes = 0;
    uint32_t next_jitter_log_frame = 0;
    com_ptr<ID3D11Buffer> jitter_staging;
+   com_ptr<ID3D11Texture2D> mv_texture;
+   com_ptr<ID3D11RenderTargetView> mv_rtv;
+   com_ptr<ID3D11Buffer> game_cb;
+   float game_cb0[64] = {};
+   bool game_cb0_valid = false;
+   float mvs_x_scale = 1920.f;
+   float mvs_y_scale = 1080.f;
+   bool mvs_jittered = false;
+   bool mv_ready = false;
+   bool mv_logged = false;
    com_ptr<ID3D11Resource> main_depth;
    UINT depth_w = 0;
    UINT depth_h = 0;
@@ -453,6 +466,9 @@ static bool ReadGameJitter(ID3D11Device* device, ID3D11DeviceContext* ctx, ETS2D
    if (FAILED(ctx->Map(gd.jitter_staging.get(), 0, D3D11_MAP_READ, 0, &m)))
       return false;
    const float* data = static_cast<const float*>(m.pData);
+   for (int i = 0; i < 64; ++i)
+      gd.game_cb0[i] = data[i];
+   gd.game_cb0_valid = true;
    const float uv_x = data[8 * 4 + 0];
    const float uv_y = data[8 * 4 + 1];
    ctx->Unmap(gd.jitter_staging.get(), 0);
@@ -484,6 +500,85 @@ static bool ReadGameJitter(ID3D11Device* device, ID3D11DeviceContext* ctx, ETS2D
    out_y = sign * uv_y * static_cast<float>(h);
    gd.jitter_px_x = out_x;
    gd.jitter_px_y = out_y;
+   return true;
+}
+
+// Runs Luma's standard fullscreen pixel-shader path to generate R16G16_FLOAT
+// motion vectors from #6127's packed depth + the game's CB0 reprojection data.
+// All graphics state is cached/restored so the following engine passes see
+// exactly the bindings they left behind.
+static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data,
+   ETS2DeviceData& gd, ID3D11ShaderResourceView* packed_srv, UINT w, UINT h)
+{
+   if (!gd.game_cb0_valid || !packed_srv)
+      return false;
+   const auto vs_it = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
+   const auto ps_it = device_data.native_pixel_shaders.find(CompileTimeStringHash("ETS2 Motion Vectors"));
+   if (vs_it == device_data.native_vertex_shaders.end() || !vs_it->second ||
+       ps_it == device_data.native_pixel_shaders.end() || !ps_it->second)
+   {
+      if (!gd.mv_logged)
+      {
+         gd.mv_logged = true;
+         reshade::log::message(reshade::log::level::warning,
+            "[ETS2 DLAA] mv shader missing (deploy Luma/Euro Truck Simulator 2/Luma_ETS2_MotionVectors.hlsl)");
+      }
+      return false;
+   }
+   if (!gd.mv_texture)
+   {
+      D3D11_TEXTURE2D_DESC d = {};
+      d.Width = w;
+      d.Height = h;
+      d.MipLevels = 1;
+      d.ArraySize = 1;
+      d.SampleDesc.Count = 1;
+      d.Usage = D3D11_USAGE_DEFAULT;
+      d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+      d.Format = DXGI_FORMAT_R16G16_FLOAT;
+      if (FAILED(device->CreateTexture2D(&d, nullptr, &gd.mv_texture)) ||
+          FAILED(device->CreateRenderTargetView(gd.mv_texture.get(), nullptr, &gd.mv_rtv)))
+      {
+         gd.mv_texture = nullptr;
+         gd.mv_rtv = nullptr;
+         return false;
+      }
+   }
+   if (!gd.game_cb)
+   {
+      D3D11_BUFFER_DESC bd = {};
+      bd.ByteWidth = 256;
+      bd.Usage = D3D11_USAGE_DYNAMIC;
+      bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+      bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+      device->CreateBuffer(&bd, nullptr, &gd.game_cb);
+   }
+   if (!gd.game_cb)
+      return false;
+   D3D11_MAPPED_SUBRESOURCE m = {};
+   if (FAILED(ctx->Map(gd.game_cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+      return false;
+   float* dst = static_cast<float*>(m.pData);
+   for (int i = 0; i < 64; ++i)
+      dst[i] = gd.game_cb0[i];
+   ctx->Unmap(gd.game_cb.get(), 0);
+
+   DrawStateStack<DrawStateStackType::FullGraphics> state_stack;
+   state_stack.Cache(ctx, device_data.uav_max_count);
+   ID3D11Buffer* cb = gd.game_cb.get();
+   ctx->PSSetConstantBuffers(0, 1, &cb);
+   DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
+      nullptr, vs_it->second.get(), ps_it->second.get(), packed_srv, gd.mv_rtv.get(),
+      w, h, false, "ETS2 Motion Vectors");
+   state_stack.Restore(ctx);
+
+   gd.mv_ready = true;
+   if (!gd.mv_logged)
+   {
+      gd.mv_logged = true;
+      const std::string msg = "[ETS2 DLAA] mv pass active " + std::to_string(w) + "x" + std::to_string(h);
+      reshade::log::message(reshade::log::level::warning, msg.c_str());
+   }
    return true;
 }
 
@@ -716,10 +811,10 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    settings.render_height = h;
    settings.hdr = true;                              // ETS2 resolves in linear RGBA16F
    settings.inverted_depth = gd.inverted_depth != 0; // set from the geometry pass DepthFunc
-   settings.mvs_jittered = false;
+   settings.mvs_jittered = gd.mvs_jittered;
    settings.auto_exposure = false;
-   settings.mvs_x_scale = 1.f;
-   settings.mvs_y_scale = 1.f;
+   settings.mvs_x_scale = gd.mvs_x_scale;
+   settings.mvs_y_scale = gd.mvs_y_scale;
    settings.render_preset = dlss_render_preset;
    if (!impl->UpdateSettings(instance, ctx, settings))
    {
@@ -773,20 +868,32 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
          dlss_source = gd.staging_source.get();
    }
 
+   // Read the game's CB0 window first (dynamic pFirstConstant). It supplies
+   // both the jitter and the reprojection constants used by the MV pass.
+   float game_jitter_x = 0.f;
+   float game_jitter_y = 0.f;
+   gd.jitter_ok = ReadGameJitter(device, ctx, gd, w, h, game_jitter_x, game_jitter_y);
+   if (srvs[4])
+      BuildMotionVectors(device, ctx, device_data, gd, srvs[4].get(), w, h);
+
    SR::SuperResolutionImpl::DrawData draw = {};
    draw.source_color = dlss_source;
    draw.output_color = dlss_output;
-   draw.motion_vectors = gd.zero_mv.get();
+   draw.motion_vectors = gd.mv_ready ? gd.mv_texture.get() : gd.zero_mv.get();
    draw.depth_buffer = gd.main_depth ? gd.main_depth.get() : (depth_resource ? depth_resource.get() : gd.const_depth.get());
    draw.render_width = w;
    draw.render_height = h;
    draw.jitter_x = 0.f;
    draw.jitter_y = 0.f;
-   gd.jitter_ok = false;
-   if (gd.use_game_jitter && ReadGameJitter(device, ctx, gd, w, h, draw.jitter_x, draw.jitter_y))
-      gd.jitter_ok = true;
+   // CB0 was read above (the MV pass needs the full window even when the user
+   // disables the game jitter for A/B testing).
+   if (gd.use_game_jitter && gd.jitter_ok)
+   {
+      draw.jitter_x = game_jitter_x;
+      draw.jitter_y = game_jitter_y;
+   }
    static bool logged_jitter_fail = false;
-   if (gd.use_game_jitter && !gd.jitter_ok && !logged_jitter_fail)
+   if (!gd.jitter_ok && !logged_jitter_fail)
    {
       logged_jitter_fail = true;
       reshade::log::message(reshade::log::level::warning,
@@ -860,7 +967,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       return false;
    }
 
-   SetSrStatus(gd, gd.main_depth ? "DLAA active (zero MV, real DSV)" : "DLAA active (zero MV, constant depth)");
+   SetSrStatus(gd, gd.mv_ready ? "DLAA active (real MV, real DSV)" : "DLAA active (zero MV, real DSV)");
    gd.dlaa_drew_this_frame = true;
    return true;
 }
@@ -885,6 +992,8 @@ public:
          {"TONEMAP_TYPE", /*default value*/ '1', true, false, /*tooltip*/ "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", /*max value*/ 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
+      native_shaders_definitions.emplace(CompileTimeStringHash("ETS2 Motion Vectors"),
+         ShaderDefinition{"Luma_ETS2_MotionVectors", reshade::api::pipeline_subobject_type::pixel_shader});
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES); // Make sure there's room for at least one extra custom define to add for development (this isn't really relevant outside of development)
 
       // Define these according to the game's original technical details and the mod's implementation (see their declarations for more).
@@ -932,6 +1041,9 @@ public:
       gd->mark_dlaa_output = g_mark_dlaa_output_ini != 0;
       gd->use_game_jitter = g_use_game_jitter_ini != 0;
       gd->invert_jitter = g_invert_jitter_ini != 0;
+      gd->mvs_x_scale = g_mvs_x_scale_ini;
+      gd->mvs_y_scale = g_mvs_y_scale_ini;
+      gd->mvs_jittered = g_mvs_jittered_ini != 0;
 #endif
    }
 
@@ -1028,6 +1140,9 @@ public:
       // silently disable jitter on the next launch.
       reshade::get_config_value(runtime, NAME, "UseGameJitterV2", g_use_game_jitter_ini);
       reshade::get_config_value(runtime, NAME, "InvertJitter", g_invert_jitter_ini);
+      reshade::get_config_value(runtime, NAME, "MvsXScale", g_mvs_x_scale_ini);
+      reshade::get_config_value(runtime, NAME, "MvsYScale", g_mvs_y_scale_ini);
+      reshade::get_config_value(runtime, NAME, "MvsJittered", g_mvs_jittered_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -1077,6 +1192,34 @@ public:
       ImGui::Text("depth %ux%u fmt=%d depth_func=%d reversed_z=%d captured=%d", game_device_data.depth_w,
          game_device_data.depth_h, game_device_data.depth_format, game_device_data.depth_func,
          game_device_data.inverted_depth, game_device_data.main_depth ? 1 : 0);
+      if (ImGui::InputFloat("MV X scale", &game_device_data.mvs_x_scale, 1.f, 100.f, "%.1f"))
+         reshade::set_config_value(runtime, NAME, "MvsXScale", game_device_data.mvs_x_scale);
+      if (ImGui::InputFloat("MV Y scale", &game_device_data.mvs_y_scale, 1.f, 100.f, "%.1f"))
+         reshade::set_config_value(runtime, NAME, "MvsYScale", game_device_data.mvs_y_scale);
+      auto set_scales = [&](float x, float y)
+      {
+         game_device_data.mvs_x_scale = x;
+         game_device_data.mvs_y_scale = y;
+         reshade::set_config_value(runtime, NAME, "MvsXScale", x);
+         reshade::set_config_value(runtime, NAME, "MvsYScale", y);
+      };
+      if (ImGui::Button("+1920/+1080"))
+         set_scales(1920.f, 1080.f);
+      ImGui::SameLine();
+      if (ImGui::Button("-1920/+1080"))
+         set_scales(-1920.f, 1080.f);
+      ImGui::SameLine();
+      if (ImGui::Button("+1920/-1080"))
+         set_scales(1920.f, -1080.f);
+      ImGui::SameLine();
+      if (ImGui::Button("-1920/-1080"))
+         set_scales(-1920.f, -1080.f);
+      if (ImGui::Checkbox("MVs jittered", &game_device_data.mvs_jittered))
+      {
+         int value = game_device_data.mvs_jittered ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "MvsJittered", value);
+      }
+      ImGui::Text("mv pass: %s", game_device_data.mv_ready ? "active" : "inactive");
       ImGui::Text("jitter uv=(%.6f,%.6f) px=(%.3f,%.3f) first=%u ok=%d", game_device_data.jitter_uv_x,
          game_device_data.jitter_uv_y, game_device_data.jitter_px_x, game_device_data.jitter_px_y,
          game_device_data.jitter_first, game_device_data.jitter_ok ? 1 : 0);

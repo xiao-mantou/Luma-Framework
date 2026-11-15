@@ -66,7 +66,15 @@ if ($null -ne $selected) {
 }
 
 $include = @()
-foreach ($config in "Development-Debug", "Development-Release", "Test-Release", "Publishing-Release") {
+# CI can restrict the matrix to one configuration (e.g. Publishing-Release) to
+# avoid rebuilding cells whose artifacts are not shipped anyway.
+$configs = if ($env:LUMA_ONLY_CONFIG) {
+    @($env:LUMA_ONLY_CONFIG)
+}
+else {
+    @("Development-Debug", "Development-Release", "Test-Release", "Publishing-Release")
+}
+foreach ($config in $configs) {
     foreach ($platform in "x64", "Win32") {
         $list = @($projects.Values | Where-Object { $_.Cells -contains "$config|$platform" -and ($null -eq $selected -or $selected[$_.Name]) } | Sort-Object Name)
         if ($list.Count -eq 0) { continue }

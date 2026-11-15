@@ -47,6 +47,7 @@ jobs:
       shell: pwsh
       env:
         LUMA_ONLY_GAME: Euro Truck Simulator 2
+        LUMA_ONLY_CONFIG: Publishing-Release
       run: ./.github/scripts/plan-build.ps1
 
   build:
@@ -113,7 +114,7 @@ jobs:
       id: create_zip
       shell: pwsh
       # We only build publishing and test for now, development builds can be built locally by devs (with the exclusion of the Generic and Graphics Analyzer mod, which can also be used to quickly download a dev/debug environment)
-      if: matrix.config == 'Publishing-Release' || matrix.config == 'Test-Release' || matrix.config == 'Development-Release'
+      if: false # full ZIP packaging disabled; only the bare addon is shipped
       env:
         PROJECTS: ${{ matrix.projects }}
         PATHS: ${{ matrix.paths }}
@@ -258,7 +259,7 @@ jobs:
         }
 
     - name: Upload ZIP
-      if: (matrix.config == 'Publishing-Release' || matrix.config == 'Test-Release' || matrix.config == 'Development-Release') && steps.create_zip.outputs.skip_upload != 'true'
+      if: false # disabled: no Package-* artifacts any more
       uses: actions/upload-artifact@v4
       with:
         name: Package-${{ matrix.config }}-${{ matrix.platform }}-${{ matrix.shard }}
@@ -291,7 +292,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: Package-*
+          pattern: Addon-only-ETS2
           merge-multiple: true  # puts all files in a single folder
 
       - name: Create release
@@ -320,4 +321,4 @@ jobs:
 
             Last commit: ${{ github.event.head_commit.message }}
           files: |
-            Luma-*.zip
+            Luma-*.addon

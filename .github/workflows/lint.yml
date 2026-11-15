@@ -1,17 +1,9 @@
 name: cpp-linter
 
+# Automatic linting is disabled for this fork. Run it by hand from the Actions tab
+# ("Run workflow") when a format check is actually wanted.
 on:
-  push:
-    branches:
-      - '*'
-    paths:
-      - 'Source/Games/Euro Truck Simulator 2/**'
-      - 'Shaders/Euro Truck Simulator 2/**'
-      - 'Source/Core/**'
-      - '.github/workflows/**'
-  pull_request:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   cpp-linter:

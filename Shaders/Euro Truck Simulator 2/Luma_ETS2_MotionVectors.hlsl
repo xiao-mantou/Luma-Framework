@@ -28,8 +28,8 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    const int2 pixel = int2(pos.xy);
    const uint2 packed = PackedDepth.Load(int3(pixel, 0));
 
-   // 0x805A8981: utof / mul 0.000244 / exp / add -1
-   const float depth = exp(float(packed.x) * 0.000244f) - 1.f;
+   // 0x805A8981: utof / mul 0.000244 / exp (D3D ISA exp is 2^x = exp2!) / add -1
+   const float depth = exp2(float(packed.x) * (1.f / 4096.118164f)) - 1.f;
 
    // 0x805A8981: and / ubfe / iadd -1 / itof
    const float2 neighbour = float2(float(packed.y & 3u) - 1.f,

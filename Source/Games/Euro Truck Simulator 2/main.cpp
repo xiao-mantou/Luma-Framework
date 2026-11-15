@@ -17,9 +17,10 @@
 // Colour input is linear HDR: 27.2% of pixels have a channel > 1.0 (max ~10).
 // No HDR or swapchain work is needed; this mod only replaces TAA with DLAA.
 //
-// v1 is a probe: it proves Luma's shader hashing finds the TAA resolve and
-// leaves every frame untouched. DLAA is wired in v2 once the packed uint
-// motion vectors are unpacked and the main depth is captured.
+// v1 proved Luma's shader hashing finds the TAA resolve (hits/frame ~= 1).
+// v2 stage 1 isolates that resolve behind a debug toggle: cancelling it must
+// produce an unresolved/jittered frame. v2 stage 2 wires DLAA once the packed
+// uint motion vectors are unpacked and the main depth is captured.
 ///////////////////////////////////////////////////////////////////////
 
 // Specify a define with the name of the game here (GAME_*).
@@ -54,13 +55,16 @@
 
 // PS hash of the TAA temporal resolve to be replaced by DLAA.
 static constexpr uint32_t kTaaResolvePS = 0x805A8981u;
+// LoadConfigs() has no DeviceData, so ini values are staged here and copied in OnCreateDevice().
+static int g_cancel_taa_resolve_ini = 0;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
    bool has_drawn_taa_resolve = false;
    uint32_t taa_resolve_hits = 0; // cumulative, shown in the ImGui panel
    uint32_t frame_index = 0;
-   bool enable_dlaa = false; // v1: always false, DLAA arrives in v2
+   bool enable_dlaa = false;        // v2 stage 2: real DLAA, still off
+   bool cancel_taa_resolve = false; // v2 stage 1 debug toggle
 };
 
 class ETS2Game final : public Game // Go view "Source/Core/includes/game.h" for all the overridable virtual functions
@@ -118,6 +122,7 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new ETS2DeviceData;
+      static_cast<ETS2DeviceData*>(device_data.game)->cancel_taa_resolve = g_cancel_taa_resolve_ini != 0;
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -131,9 +136,15 @@ public:
       {
          ++game_device_data.taa_resolve_hits;
          game_device_data.has_drawn_taa_resolve = true;
+
+         // v2 stage 1: prove this resolve is the sole writer of the final colour.
+         // With the toggle on the frame should turn into an un-resolved, jittered
+         // mess. If it stays clean, a later pass re-resolves over the output and
+         // stage 2 will have to cancel that one too.
+         if (game_device_data.cancel_taa_resolve)
+            return DrawOrDispatchOverrideType::Skip;
       }
 
-      // v1 deliberately keeps the engine's TAA running and never cancels a draw.
       return DrawOrDispatchOverrideType::None;
    }
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
@@ -151,6 +162,7 @@ public:
       // ReShade.ini is ready here, so load its values.
       reshade::get_config_value(runtime, NAME, "GameSetting01", cb_luma_global_settings.GameSettings.GameSetting01);
       reshade::get_config_value(runtime, NAME, "GameSetting02", cb_luma_global_settings.GameSettings.GameSetting02);
+      reshade::get_config_value(runtime, NAME, "CancelTaaResolve", g_cancel_taa_resolve_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -158,9 +170,17 @@ public:
       reshade::api::effect_runtime* runtime = nullptr;
       auto& game_device_data = GetGameDeviceData(device_data);
 
-      ImGui::Text("ETS2 DLAA probe v1");
+      ImGui::Text("ETS2 DLAA - v2 stage 1 (resolve isolation)");
       ImGui::Text("TAA resolve 0x805A8981 hits: %u (frame %u)", game_device_data.taa_resolve_hits, game_device_data.frame_index);
-      ImGui::Text("DLAA: %s", game_device_data.enable_dlaa ? "requested (v2)" : "off - v1 is probe only");
+      if (game_device_data.frame_index > 0)
+         ImGui::Text("hits/frame: %.2f", float(game_device_data.taa_resolve_hits) / float(game_device_data.frame_index));
+      ImGui::Text("DLAA: off (stage 2)");
+      if (ImGui::Checkbox("Cancel TAA resolve (debug)", &game_device_data.cancel_taa_resolve))
+      {
+         int value = game_device_data.cancel_taa_resolve ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "CancelTaaResolve", value);
+      }
+      ImGui::Text("ON -> unresolved/jittered frame; clean frame means a later pass re-resolves.");
       ImGui::Separator();
 
       // Draw whatever ImGui to let users modify settings.
@@ -198,7 +218,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       uint32_t mod_version = 1; // Increase this to reset the game settings and shader binaries after making large changes to your mod
                                 // NOTE: the website argument must never be nullptr; SetGlobals() copies it with
       // strncpy() (globals.h), and a null source crashes DllMain with error 1114.
-      Globals::SetGlobals(cleared_project_name, "ETS2 DLAA probe v1", "", mod_version);
+      Globals::SetGlobals(cleared_project_name, "ETS2 DLAA v2 stage 1", "", mod_version);
 
       // The following can be toggled in the dev settings (it generally only fully applies after changing the game's resolution).
       // Default these to "false" for the mod to not do "anything" that might cause issues with the game by default.

@@ -81,28 +81,37 @@ struct ETS2DeviceData final : public GameDeviceData
 // #6127 packs neighbour min/max depth into R16G16_UINT. Until that is decoded,
 // feed DLAA zero motion + a constant depth. Every failure path returns false so
 // the engine keeps its own TAA; this function never leaves the frame broken.
+static void SetSrStatus(ETS2DeviceData& gd, const char* status)
+{
+   if (gd.sr_status == status)
+      return;
+   gd.sr_status = status;
+   const std::string message = std::string("[ETS2 DLAA] ") + status;
+   reshade::log::message(reshade::log::level::warning, message.c_str());
+}
+
 static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data, ETS2DeviceData& gd)
 {
    if (device_data.sr_type == SR::Type::None)
    {
-      gd.sr_status = "sr_type=None: pick DLSS in Luma > Super Resolution";
+      SetSrStatus(gd, "sr_type=None: pick DLSS in Luma > Super Resolution");
       return false;
    }
    if (device_data.sr_suppressed)
    {
-      gd.sr_status = "SR suppressed by core";
+      SetSrStatus(gd, "SR suppressed by core");
       return false;
    }
    if (device_data.has_drawn_sr)
    {
-      gd.sr_status = "SR already drew this frame";
+      SetSrStatus(gd, "SR already drew this frame");
       return false;
    }
    auto* instance = device_data.GetSRInstanceData();
    auto* impl = sr_implementations.count(device_data.sr_type) ? sr_implementations[device_data.sr_type].get() : nullptr;
    if (!instance || !impl)
    {
-      gd.sr_status = "no SR instance (pick DLSS in the Luma menu)";
+      SetSrStatus(gd, "no SR instance (pick DLSS in the Luma menu)");
       return false;
    }
 
@@ -113,7 +122,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    ctx->OMGetRenderTargets(1, &rtv, &dsv);
    if (!srvs[0] || !rtv)
    {
-      gd.sr_status = "missing SRV0 / RTV0";
+      SetSrStatus(gd, "missing SRV0 / RTV0");
       return false;
    }
 
@@ -126,14 +135,14 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       dsv->GetResource(&depth_resource);
    if (!source_color || !output_color)
    {
-      gd.sr_status = "missing colour resources";
+      SetSrStatus(gd, "missing colour resources");
       return false;
    }
 
    com_ptr<ID3D11Texture2D> output_tex;
    if (FAILED(output_color->QueryInterface(&output_tex)) || !output_tex)
    {
-      gd.sr_status = "output is not a 2D texture";
+      SetSrStatus(gd, "output is not a 2D texture");
       return false;
    }
    D3D11_TEXTURE2D_DESC out_desc = {};
@@ -162,7 +171,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    }
    if (!gd.zero_mv || !gd.const_depth)
    {
-      gd.sr_status = "placeholder texture alloc failed";
+      SetSrStatus(gd, "placeholder texture alloc failed");
       return false;
    }
 
@@ -180,7 +189,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    settings.render_preset = dlss_render_preset;
    if (!impl->UpdateSettings(instance, ctx, settings))
    {
-      gd.sr_status = "UpdateSettings failed";
+      SetSrStatus(gd, "UpdateSettings failed");
       device_data.force_reset_sr = true;
       return false;
    }
@@ -194,7 +203,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       gd.uav_output = nullptr;
       if (FAILED(device->CreateTexture2D(&uav_desc, nullptr, &gd.uav_output)) || !gd.uav_output)
       {
-         gd.sr_status = "UAV proxy alloc failed";
+         SetSrStatus(gd, "UAV proxy alloc failed");
          return false;
       }
       dlss_output = gd.uav_output.get();
@@ -214,13 +223,13 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
 
    if (!impl->Draw(instance, ctx, draw))
    {
-      gd.sr_status = "Draw failed";
+      SetSrStatus(gd, "Draw failed");
       return false;
    }
    if (need_copy)
       ctx->CopyResource(output_color.get(), dlss_output);
 
-   gd.sr_status = depth_resource ? "DLAA active (zero MV, real DSV)" : "DLAA active (zero MV, constant depth)";
+   SetSrStatus(gd, depth_resource ? "DLAA active (zero MV, real DSV)" : "DLAA active (zero MV, constant depth)");
    device_data.has_drawn_sr = true;
    return true;
 }

@@ -265,6 +265,12 @@ static const char* DepthFormatName(DXGI_FORMAT f)
       return "R32_TYPELESS";
    case DXGI_FORMAT_D32_FLOAT:
       return "D32_FLOAT";
+   case DXGI_FORMAT_R32G8X24_TYPELESS:
+      return "R32G8X24_TYPELESS";
+   case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      return "D32_FLOAT_S8X24_UINT";
+   case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+      return "R32_FLOAT_X8X24_TYPELESS";
    case DXGI_FORMAT_R24G8_TYPELESS:
       return "R24G8_TYPELESS";
    case DXGI_FORMAT_D24_UNORM_S8_UINT:
@@ -337,25 +343,28 @@ static void ProbeMainDepth(ID3D11DeviceContext* ctx, ETS2DeviceData& gd)
       ++gd.depth_rejected;
       return;
    }
-   // Accept only full-resolution depth. Threshold comes from #6128's RTV0,
-   // which follows the game's render scale - not the swapchain, not 1080p.
-   const bool have_target = gd.target_w > 0 && gd.target_h > 0;
-   const bool accepted = have_target
-                            ? (d.Width >= gd.target_w * 0.9f && d.Height >= gd.target_h * 0.9f)
-                            : (static_cast<uint64_t>(d.Width) * d.Height > static_cast<uint64_t>(gd.depth_w) * gd.depth_h);
+   // The baseline is #6128's RTV0 size (DLAA's real render resolution, follows
+   // r_scale) - not the swapchain, not a hardcoded 1080p. Wait for the first
+   // resolve before accepting anything; a "largest DSV" fallback picks up the
+   // 4096x4096 shadow atlas instead of the main depth.
+   if (gd.target_w == 0 || gd.target_h == 0)
+      return;
+   // Both a lower AND an upper bound are required: shadow atlases are much
+   // larger than the render target and otherwise pass the >= test.
+   const bool accepted = d.Width >= gd.target_w * 0.9f && d.Width <= gd.target_w * 1.05f &&
+                         d.Height >= gd.target_h * 0.9f && d.Height <= gd.target_h * 1.05f;
    if (!accepted)
    {
       if (gd.depth_rejected < 3)
       {
          ++gd.depth_rejected;
-         const std::string msg = "[ETS2 DLAA] depth rejected " + std::to_string(d.Width) + "x" +
-                                 std::to_string(d.Height) + " fmt=" + std::to_string(static_cast<int>(d.Format));
+         const std::string msg = "[ETS2 DLAA] depth out of range " + std::to_string(d.Width) + "x" +
+                                 std::to_string(d.Height) + " target=" + std::to_string(gd.target_w) + "x" +
+                                 std::to_string(gd.target_h) + " fmt=" + std::to_string(static_cast<int>(d.Format));
          reshade::log::message(reshade::log::level::warning, msg.c_str());
       }
       return;
    }
-   if (gd.main_depth && static_cast<uint64_t>(d.Width) * d.Height < static_cast<uint64_t>(gd.depth_w) * gd.depth_h)
-      return;
    gd.main_depth = candidate;
    gd.depth_w = d.Width;
    gd.depth_h = d.Height;
@@ -367,6 +376,7 @@ static void ProbeMainDepth(ID3D11DeviceContext* ctx, ETS2DeviceData& gd)
                               std::to_string(reinterpret_cast<unsigned long long>(dsv)) +
                               " fmt=" + std::to_string(static_cast<int>(d.Format)) + " (" + DepthFormatName(d.Format) + ")" +
                               " size=" + std::to_string(d.Width) + "x" + std::to_string(d.Height) +
+                              " target=" + std::to_string(gd.target_w) + "x" + std::to_string(gd.target_h) +
                               " array=" + std::to_string(d.ArraySize) + " sample=" + std::to_string(d.SampleDesc.Count);
       reshade::log::message(reshade::log::level::warning, msg.c_str());
    }
@@ -850,7 +860,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       return false;
    }
 
-   SetSrStatus(gd, depth_resource ? "DLAA active (zero MV, real DSV)" : "DLAA active (zero MV, constant depth)");
+   SetSrStatus(gd, gd.main_depth ? "DLAA active (zero MV, real DSV)" : "DLAA active (zero MV, constant depth)");
    gd.dlaa_drew_this_frame = true;
    return true;
 }

@@ -196,7 +196,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       const char* cleared_project_name = (project_name[0] == '_') ? (project_name + 1) : project_name; // Remove the potential "_" at the beginning. This can include spaces!
 
       uint32_t mod_version = 1; // Increase this to reset the game settings and shader binaries after making large changes to your mod
-      Globals::SetGlobals(cleared_project_name, "ETS2 DLAA probe v1", nullptr /*E.g. Nexus link*/, mod_version);
+                                // NOTE: the website argument must never be nullptr; SetGlobals() copies it with
+      // strncpy() (globals.h), and a null source crashes DllMain with error 1114.
+      Globals::SetGlobals(cleared_project_name, "ETS2 DLAA probe v1", "", mod_version);
 
       // The following can be toggled in the dev settings (it generally only fully applies after changing the game's resolution).
       // Default these to "false" for the mod to not do "anything" that might cause issues with the game by default.

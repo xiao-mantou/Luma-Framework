@@ -83,8 +83,21 @@ struct ETS2DeviceData final : public GameDeviceData
 // the engine keeps its own TAA; this function never leaves the frame broken.
 static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data, ETS2DeviceData& gd)
 {
-   if (device_data.sr_type == SR::Type::None || device_data.sr_suppressed || device_data.has_drawn_sr)
+   if (device_data.sr_type == SR::Type::None)
+   {
+      gd.sr_status = "sr_type=None: pick DLSS in Luma > Super Resolution";
       return false;
+   }
+   if (device_data.sr_suppressed)
+   {
+      gd.sr_status = "SR suppressed by core";
+      return false;
+   }
+   if (device_data.has_drawn_sr)
+   {
+      gd.sr_status = "SR already drew this frame";
+      return false;
+   }
    auto* instance = device_data.GetSRInstanceData();
    auto* impl = sr_implementations.count(device_data.sr_type) ? sr_implementations[device_data.sr_type].get() : nullptr;
    if (!instance || !impl)
@@ -343,6 +356,8 @@ public:
       }
       ImGui::Text("DLAA draws: %u  failures: %u", game_device_data.sr_draws, game_device_data.sr_failures);
       ImGui::Text("status: %s", game_device_data.sr_status);
+      ImGui::Text("sr_suppressed=%d has_drawn_sr=%d", device_data.sr_suppressed ? 1 : 0, device_data.has_drawn_sr ? 1 : 0);
+      ImGui::Text("Select 'DLSS' in the Super Resolution combo above first.");
 #endif
       if (ImGui::Checkbox("Cancel TAA resolve (debug)", &game_device_data.cancel_taa_resolve))
       {

@@ -73,13 +73,15 @@ jobs:
     # Only packaging needs ReShade, and only for this cell's platform
     - name: ReShade submodule SHA
       id: reshade_sha
-      if: matrix.config != 'Development-Debug'
+      # Set the repo variable BUILD_RESHADE=true to build/ship ReShade again.
+      # ETS2 already has the matching dxgi.dll installed, so skip it by default.
+      if: matrix.config != 'Development-Debug' && vars.BUILD_RESHADE == 'true'
       shell: pwsh
       run: '"sha=$(git rev-parse HEAD:Source/External/reshade)" >> $env:GITHUB_OUTPUT'
 
     - name: Cache ReShade
       id: reshade_cache
-      if: matrix.config != 'Development-Debug'
+      if: matrix.config != 'Development-Debug' && vars.BUILD_RESHADE == 'true'
       uses: actions/cache@v6
       with:
         path: Source/External/reshade/bin/${{ matrix.platform }}/Release/ReShade*.dll
@@ -88,7 +90,7 @@ jobs:
     # This requires the git directory to be added to the PATH Windows environment variables, to properly set up versioning information
     # ReShade takes its version from "git describe --tags", so its shallow submodule needs the full history and tags first
     - name: Build ReShade.sln Release
-      if: matrix.config != 'Development-Debug' && steps.reshade_cache.outputs.cache-hit != 'true'
+      if: matrix.config != 'Development-Debug' && steps.reshade_cache.outputs.cache-hit != 'true' && vars.BUILD_RESHADE == 'true'
       run: |
         git -C Source/External/reshade fetch --unshallow --tags --no-recurse-submodules
         msbuild "Source\External\reshade\ReShade.sln" /m /p:Configuration="Release" /p:Platform="${{ matrix.platform == 'x64' && '64-bit' || '32-bit' }}" /p:PlatformToolset=v145
@@ -264,6 +266,17 @@ jobs:
         path: |
           Luma-*.zip
         compression-level: 0 # the zips are already compressed
+
+    # Tiny artifact for quick iteration: only the rebuilt addon. Existing installs
+    # already have dxgi.dll / Luma/ / NGX, so this avoids downloading the full ZIP
+    # (which is slow on rate-limited connections).
+    - name: Upload bare addon
+      if: matrix.config == 'Publishing-Release'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Addon-only-ETS2
+        path: Binaries/${{ matrix.platform }}-${{ matrix.config }}/Luma-*.addon
+        compression-level: 0
 
   release:
     # Forks usually lack GH_PAT; only publish when explicitly requested via workflow_dispatch.

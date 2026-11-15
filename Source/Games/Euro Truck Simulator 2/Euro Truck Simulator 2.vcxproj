@@ -48,8 +48,10 @@
     <VcpkgTriplet Condition="'$(Platform)'=='Win32'">x86-windows</VcpkgTriplet>
   </PropertyGroup>
   <PropertyGroup>
-    <!-- DLAA replaces the engine TAA resolve; NGX (DLSS) code paths must be compiled in. -->
-    <UseLumaNGX>true</UseLumaNGX>
+    <!-- v1 is a hash-identification probe and never calls DLSS. Keep NGX off so the
+         package does not ship the 58 MB nvngx_dlss.dll (slow artifact downloads).
+         Turn this back on for v2, when the TAA resolve is actually replaced by DLAA. -->
+    <UseLumaNGX>false</UseLumaNGX>
     <!-- Packaging defaults to off; enable via Project Properties -> Luma Properties -> Package after build. -->
     <LumaPackage>false</LumaPackage>
   </PropertyGroup>

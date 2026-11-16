@@ -68,7 +68,7 @@ static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
 static int g_use_game_jitter_ini = 1;
 static int g_invert_jitter_x_ini = 0; // 0 = sign +1
-static int g_invert_jitter_y_ini = 0; // 0 = sign -1 (opposite to X in DirectX UV vs NDC)
+static int g_invert_jitter_y_ini = 0; // 0 = sign +1
 static float g_mvs_x_scale_ini = 1920.f;
 static float g_mvs_y_scale_ini = 1080.f;
 static int g_mvs_jittered_ini = 0;
@@ -603,7 +603,7 @@ static bool ReadGameJitter(ID3D11Device* device, ID3D11DeviceContext* ctx, ETS2D
    if (fabsf(uv_x) > 0.5f || fabsf(uv_y) > 0.5f)
       return false;
    const float sign_x = gd.invert_jitter_x ? -1.f : 1.f;
-   const float sign_y = gd.invert_jitter_y ? 1.f : -1.f; // DirectX UV Y is inverted relative to NDC Y
+   const float sign_y = gd.invert_jitter_y ? -1.f : 1.f;
    out_x = sign_x * uv_x * static_cast<float>(w);
    out_y = sign_y * uv_y * static_cast<float>(h);
    gd.jitter_px_x = out_x;
@@ -935,14 +935,12 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    settings.inverted_depth = gd.inverted_depth != 0; // set from the geometry pass DepthFunc
    settings.mvs_jittered = gd.mvs_jittered;
    settings.auto_exposure = false;
-   float scale_x = gd.mvs_x_scale;
-   float scale_y = gd.mvs_y_scale;
-   if (fabsf(scale_x) == 1920.f && w != 1920 && w > 0)
-      scale_x = (scale_x < 0.f ? -1.f : 1.f) * static_cast<float>(w);
-   if (fabsf(scale_y) == 1080.f && h != 1080 && h > 0)
-      scale_y = (scale_y < 0.f ? -1.f : 1.f) * static_cast<float>(h);
-   settings.mvs_x_scale = scale_x;
-   settings.mvs_y_scale = scale_y;
+   if ((gd.mvs_x_scale == 0.f || fabsf(gd.mvs_x_scale) == 1920.f) && w > 0 && w != 1920)
+      gd.mvs_x_scale = (gd.mvs_x_scale < 0.f ? -1.f : 1.f) * static_cast<float>(w);
+   if ((gd.mvs_y_scale == 0.f || fabsf(gd.mvs_y_scale) == 1080.f) && h > 0 && h != 1080)
+      gd.mvs_y_scale = (gd.mvs_y_scale < 0.f ? -1.f : 1.f) * static_cast<float>(h);
+   settings.mvs_x_scale = gd.mvs_x_scale;
+   settings.mvs_y_scale = gd.mvs_y_scale;
    settings.render_preset = dlss_render_preset;
    static bool logged_scale = false;
    if (!logged_scale)
@@ -1369,6 +1367,8 @@ public:
          set_scales(rw, rh);
       }
       ImGui::SameLine();
+      ImGui::Text("(Target: %ux%u)", game_device_data.target_w, game_device_data.target_h);
+      ImGui::SameLine();
       if (ImGui::Button("+1920/+1080"))
          set_scales(1920.f, 1080.f);
       ImGui::SameLine();
@@ -1388,7 +1388,7 @@ public:
       ImGui::Text("mv pass: %s", game_device_data.mv_ready ? "active" : "inactive");
       ImGui::Text("jitter uv=(%.6f,%.6f) px=(%.3f,%.3f) signs=(%.0f,%.0f) ok=%d", game_device_data.jitter_uv_x,
          game_device_data.jitter_uv_y, game_device_data.jitter_px_x, game_device_data.jitter_px_y,
-         game_device_data.invert_jitter_x ? -1.f : 1.f, game_device_data.invert_jitter_y ? 1.f : -1.f,
+         game_device_data.invert_jitter_x ? -1.f : 1.f, game_device_data.invert_jitter_y ? -1.f : 1.f,
          game_device_data.jitter_ok ? 1 : 0);
       if (ImGui::Checkbox("Mark our output (magenta block, proves overwrite)", &game_device_data.mark_dlaa_output))
       {

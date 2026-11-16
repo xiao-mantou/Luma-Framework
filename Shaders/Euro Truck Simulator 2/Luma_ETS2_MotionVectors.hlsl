@@ -48,20 +48,18 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    // Read GBuffer flags (SRV 15, R16G16B16A16_UINT):
    // Disassembly of ETS2 TAA resolve 0x805A8981:
    //   lines 39-42 & 101: bit 13 of .w flags vehicle / dynamic mesh geometry
-   //   lines 101, 170 & 296: bit 0 of .z flags valid temporal history (1 = static cabin interior; 0 = dynamic mirror reflection/screen)
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
-   const bool has_valid_history = (gbuffer.z & 1u) != 0;
 
    // 1. Rearview mirror reflections (physical mirrors + electronic mirror displays):
    // Mirrors display the world behind the truck. Planar reflections have NO valid
    // camera-space motion vectors from the main depth buffer.
-   // ETS2's original TAA flags mirrors with (gbuffer.z & 1) == 0 (invalid history) to bypass TAA.
-   // If assigned cabin MV=(0,0), DLSS accumulates 16+ frames of moving reflection at 0 offset,
-   // causing heavy smear, blur and ghosting.
-   // Returning an off-screen motion vector (2.0, 2.0) signals DLSS that history is disoccluded,
-   // forcing sharp, fresh current-frame reconstruction with ZERO temporal smear!
-   const bool is_mirror = (!has_valid_history && (depth < 3.5f || (is_vehicle_flag && depth < 8.0f)));
+   // Mirrors are located strictly at the left/right window edges (uv.x < 0.28 or > 0.72)
+   // or top curb mirror (uv.y < 0.22 && uv.x > 0.45 && uv.x < 0.75), within near depth (< 3.5m).
+   // Center area (0.28 <= uv.x <= 0.72) is strictly the driver cabin and windscreen road;
+   // never mark center pixels as mirrors so the cabin gets full DLAA temporal accumulation!
+   const bool in_mirror_rect = (uv.x < 0.28f || uv.x > 0.72f || (uv.y < 0.22f && uv.x > 0.45f && uv.x < 0.75f));
+   const bool is_mirror = is_vehicle_flag && in_mirror_rect && (depth < 3.5f);
    if (is_mirror)
    {
       return float2(2.0f, 2.0f);
@@ -70,7 +68,7 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    // 2. Cabin / vehicle geometry (dashboard, steering wheel, window pillars, mirror frames):
    // Rigidly attached to the camera in first-person view.
    // Uses pure rotation reprojection (zero out camera translation) to keep the cabin rock solid.
-   const bool is_cabin = (is_vehicle_flag && has_valid_history && depth < 8.0f) || (has_valid_history && depth < 3.5f);
+   const bool is_cabin = is_vehicle_flag && (depth < 8.0f);
 
    float clip_x, clip_y, clip_w;
    if (is_cabin)
@@ -93,10 +91,14 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    if (outside)
       return float2(0.f, 0.f); // movc falls back to the current UV => MV = 0
 
-   // 0x805A8981: div by clip.w ; mad (0.5,-0.5) ; add 0.5
-   // Note: cb0[8].xy (jitter) is removed so MVs are pure and jitter-free for DLSS
+   // 0x805A8981 lines 74-75:
+   //   mad r5.xy, r5.xy, float2(0.5, -0.5), cb0[8].xy
+   //   add r5.xy, r5.xy, float2(0.5, 0.5)
+   // Crucial: cb0[8].xy is added to cancel the projection jitter between frames!
+   // Without +cb0[8].xy, the reprojection matrix leaves ~0.58px of residual jitter in the MV,
+   // causing high-frequency screen vibration in static scenes.
    const float2 ndc = float2(clip_x, clip_y) / clip_w;
-   const float2 reprojected_uv = ndc * float2(0.5f, -0.5f) + 0.5f;
+   const float2 reprojected_uv = ndc * float2(0.5f, -0.5f) + 0.5f + cb0[8].xy;
 
    // 0x805A8981: mad r1.xz, reproj, cb0[10].xy, -r1.xz ; add v1.xy
    const float2 history_uv = reprojected_uv * cb0[10].xy - neighbour * cb0[9].yz;

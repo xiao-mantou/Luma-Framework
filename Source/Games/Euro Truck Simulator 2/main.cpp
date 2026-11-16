@@ -63,7 +63,7 @@ static int g_cancel_taa_resolve_ini = 0;
 static int g_enable_dlaa_ini = 0;
 static int g_test_output_path_ini = 0;
 static int g_bypass_ngx_ini = 0;
-static int g_source_slot_ini = -1; // -1 = auto (pick first RGBA16F SRV that is not RTV0)
+static int g_source_slot_ini = 1; // 1 = slot 1 (current frame jittered colour in ETS2 #6128)
 static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
 static int g_use_game_jitter_ini = 1;
@@ -613,7 +613,7 @@ static bool ReadGameJitter(ID3D11Device* device, ID3D11DeviceContext* ctx, ETS2D
 // All graphics state is cached/restored so the following engine passes see
 // exactly the bindings they left behind.
 static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data,
-   ETS2DeviceData& gd, ID3D11ShaderResourceView* packed_srv, UINT w, UINT h)
+   ETS2DeviceData& gd, ID3D11ShaderResourceView* packed_srv, ID3D11ShaderResourceView* gbuffer_srv, UINT w, UINT h)
 {
    if (!gd.game_cb0_valid || !packed_srv)
       return false;
@@ -672,6 +672,8 @@ static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, D
    state_stack.Cache(ctx, device_data.uav_max_count);
    ID3D11Buffer* cb = gd.game_cb.get();
    ctx->PSSetConstantBuffers(0, 1, &cb);
+   ID3D11ShaderResourceView* srv1 = gbuffer_srv;
+   ctx->PSSetShaderResources(1, 1, &srv1);
    DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
       nullptr, vs_it->second.get(), ps_it->second.get(), packed_srv, gd.mv_rtv.get(),
       w, h, false, "ETS2 Motion Vectors");
@@ -712,10 +714,10 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       return false;
    }
 
-   com_ptr<ID3D11ShaderResourceView> srvs[8] = {};
+   com_ptr<ID3D11ShaderResourceView> srvs[16] = {};
    com_ptr<ID3D11RenderTargetView> rtv;
    com_ptr<ID3D11DepthStencilView> dsv;
-   ctx->PSGetShaderResources(0, 8, &srvs[0]);
+   ctx->PSGetShaderResources(0, 16, &srvs[0]);
    ctx->OMGetRenderTargets(1, &rtv, &dsv);
 
    com_ptr<ID3D11Resource> output_color;
@@ -730,10 +732,10 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    // One-shot audit of every PS SRV slot. #6128 writes RTV0 (A15EA0), which is
    // also consumed as the next frame's history. If the colour input resolves to
    // that same resource, DLSS reads back its own output -> feedback black frame.
-   com_ptr<ID3D11Resource> srv_res[8] = {};
-   DXGI_FORMAT srv_fmt[8] = {};
-   bool srv_same[8] = {};
-   for (int i = 0; i < 8; ++i)
+   com_ptr<ID3D11Resource> srv_res[16] = {};
+   DXGI_FORMAT srv_fmt[16] = {};
+   bool srv_same[16] = {};
+   for (int i = 0; i < 16; ++i)
    {
       srv_fmt[i] = DXGI_FORMAT_UNKNOWN;
       if (!srvs[i])
@@ -748,13 +750,20 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    int slot = gd.source_slot;
    if (slot < 0 || slot > 7)
    {
-      slot = 0;
-      for (int i = 0; i < 8; ++i)
+      if (srv_res[1] && !srv_same[1] && srv_fmt[1] == DXGI_FORMAT_R16G16B16A16_FLOAT)
       {
-         if (srv_res[i] && !srv_same[i] && srv_fmt[i] == DXGI_FORMAT_R16G16B16A16_FLOAT)
+         slot = 1;
+      }
+      else
+      {
+         slot = 0;
+         for (int i = 0; i < 8; ++i)
          {
-            slot = i;
-            break;
+            if (srv_res[i] && !srv_same[i] && srv_fmt[i] == DXGI_FORMAT_R16G16B16A16_FLOAT)
+            {
+               slot = i;
+               break;
+            }
          }
       }
    }
@@ -779,10 +788,15 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       std::string line = "[ETS2 DLAA] bindings out=" +
                          std::to_string(reinterpret_cast<unsigned long long>(output_color.get())) +
                          " slot=" + std::to_string(slot);
-      for (int i = 0; i < 8; ++i)
-         line += " | s" + std::to_string(i) + "=" +
-                 std::to_string(reinterpret_cast<unsigned long long>(srv_res[i].get())) +
-                 " fmt=" + std::to_string(static_cast<int>(srv_fmt[i])) + (srv_same[i] ? " SAME" : "");
+      for (int i = 0; i < 16; ++i)
+      {
+         if (srvs[i])
+         {
+            line += " | s" + std::to_string(i) + "=" +
+                    std::to_string(reinterpret_cast<unsigned long long>(srv_res[i].get())) +
+                    " fmt=" + std::to_string(static_cast<int>(srv_fmt[i])) + (srv_same[i] ? " SAME" : "");
+         }
+      }
       reshade::log::message(reshade::log::level::warning, line.c_str());
    }
 
@@ -918,9 +932,23 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    settings.inverted_depth = gd.inverted_depth != 0; // set from the geometry pass DepthFunc
    settings.mvs_jittered = gd.mvs_jittered;
    settings.auto_exposure = false;
-   settings.mvs_x_scale = gd.mvs_x_scale;
-   settings.mvs_y_scale = gd.mvs_y_scale;
+   float scale_x = gd.mvs_x_scale;
+   float scale_y = gd.mvs_y_scale;
+   if (fabsf(scale_x) == 1920.f && w != 1920 && w > 0)
+      scale_x = (scale_x < 0.f ? -1.f : 1.f) * static_cast<float>(w);
+   if (fabsf(scale_y) == 1080.f && h != 1080 && h > 0)
+      scale_y = (scale_y < 0.f ? -1.f : 1.f) * static_cast<float>(h);
+   settings.mvs_x_scale = scale_x;
+   settings.mvs_y_scale = scale_y;
    settings.render_preset = dlss_render_preset;
+   static bool logged_scale = false;
+   if (!logged_scale)
+   {
+      logged_scale = true;
+      const std::string scale_msg = "[ETS2 DLAA] mvs_scale (" + std::to_string(scale_x) + ", " +
+                                    std::to_string(scale_y) + ") res " + std::to_string(w) + "x" + std::to_string(h);
+      reshade::log::message(reshade::log::level::warning, scale_msg.c_str());
+   }
    if (!impl->UpdateSettings(instance, ctx, settings))
    {
       SetSrStatus(gd, "UpdateSettings failed");
@@ -979,7 +1007,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    float game_jitter_y = 0.f;
    gd.jitter_ok = ReadGameJitter(device, ctx, gd, w, h, game_jitter_x, game_jitter_y);
    if (srvs[4])
-      BuildMotionVectors(device, ctx, device_data, gd, srvs[4].get(), w, h);
+      BuildMotionVectors(device, ctx, device_data, gd, srvs[4].get(), srvs[15].get(), w, h);
 
    if (gd.mv_ready && gd.frame_index >= gd.next_mv_stats_frame && gd.mv_stats_logs < 8)
    {
@@ -1323,6 +1351,13 @@ public:
          reshade::set_config_value(runtime, NAME, "MvsXScale", x);
          reshade::set_config_value(runtime, NAME, "MvsYScale", y);
       };
+      if (ImGui::Button("Match Res"))
+      {
+         const float rw = game_device_data.target_w ? static_cast<float>(game_device_data.target_w) : 1920.f;
+         const float rh = game_device_data.target_h ? static_cast<float>(game_device_data.target_h) : 1080.f;
+         set_scales(rw, rh);
+      }
+      ImGui::SameLine();
       if (ImGui::Button("+1920/+1080"))
          set_scales(1920.f, 1080.f);
       ImGui::SameLine();

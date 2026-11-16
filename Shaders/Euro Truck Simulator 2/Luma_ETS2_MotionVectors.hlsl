@@ -1,20 +1,14 @@
-// ETS2 DLAA: reconstruct motion vectors from #6127's packed depth buffer.
+// ETS2 DLAA: reconstruct motion vectors from #6127's packed depth buffer
+// and GBuffer flags (SRV 15) to separate the vehicle cabin from the world.
 //
-// 1:1 translation of the reprojection math in PS 0x805A8981 (TAA resolve).
 // Inputs:
 //   t0 = SRV4, R16G16_UINT written by #6127 (0xB824672E)
-//          .x = log(minDepth + 1) * 4096.118164
+//          .x = log2(minDepth + 1) * 4096.118164
 //          .y = [bits 0..1] 3x3 min X offset - 1
 //               [bits 2..3] 3x3 min Y offset - 1
-//               [bits 4.. ] second log-quantized depth (not needed for MV)
-//   b0 = a 256-byte copy of the game's CB0 (16 x float4). The engine
-//        suballocates a 2 MB ring buffer with a dynamic pFirstConstant, so
-//        C++ reads PSGetConstantBuffers1() and copies the active 256-byte
-//        window into this self-contained cbuffer instead of binding the
-//        game's buffer directly.
-//
-// Output is a UV-space MV (historyUV - currentUV). NGX converts it to pixel
-// space via InMVScaleX/InMVScaleY, exposed as mvs_x_scale / mvs_y_scale.
+//   t1 = SRV15, R16G16B16A16_UINT GBuffer flags written by geometry pass
+//          .w [bit 13] dynamic / vehicle object flag (0x805A8981 disasm line 39 & 100)
+//   b0 = a 256-byte copy of the game's CB0 (16 x float4)
 
 cbuffer GameCB0 : register(b0)
 {
@@ -22,13 +16,14 @@ cbuffer GameCB0 : register(b0)
 };
 
 Texture2D<uint2> PackedDepth : register(t0);
+Texture2D<uint4> GBufferFlags : register(t1);
 
 float2 main(float4 pos : SV_Position) : SV_Target0
 {
    const int2 pixel = int2(pos.xy);
    const uint2 packed = PackedDepth.Load(int3(pixel, 0));
 
-   // 0x805A8981: utof / mul 0.000244 / exp (D3D ISA exp is 2^x = exp2!) / add -1
+   // 0x805A8981: utof / mul 0.000244 / exp2 / add -1
    const float depth = exp2(float(packed.x) * (1.f / 4096.118164f)) - 1.f;
 
    // 0x805A8981: and / ubfe / iadd -1 / itof
@@ -50,22 +45,44 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    float4 ray = float4(ray_xy, 1.f, 1.f);
    ray.xyz *= -depth;
 
-   // 0x805A8981: dp4 with the previous-frame view-projection rows 0/1/3
-   const float clip_x = dot(cb0[0], ray);
-   const float clip_y = dot(cb0[1], ray);
-   const float clip_w = dot(cb0[3], ray);
+   // Read GBuffer flags (SRV 15):
+   // 0x805A8981 lines 39 & 100-101: bit 13 of .w flags dynamic / vehicle geometry
+   const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
+   const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
+
+   // In first-person cabin view, the interior/dashboard/hood is rigidly attached to the camera.
+   // Outside world begins beyond the windshield (depth > 3.5m).
+   // Vehicle cabin uses pure-rotation reprojection (translation .w = 0) so driving forward has
+   // ZERO fake displacement, while turning head to check mirrors has exact angular motion!
+   const bool is_cabin = (depth < 3.5f) || (is_vehicle_flag && depth < 8.0f);
+
+   float clip_x, clip_y, clip_w;
+   if (is_cabin)
+   {
+      // Pure rotation reprojection: zero out translation column (.w = 0)
+      clip_x = dot(float4(cb0[0].xyz, 0.f), ray);
+      clip_y = dot(float4(cb0[1].xyz, 0.f), ray);
+      clip_w = dot(float4(cb0[3].xyz, 0.f), ray);
+   }
+   else
+   {
+      // Full camera reprojection (translation + rotation) for the outside world
+      clip_x = dot(cb0[0], ray);
+      clip_y = dot(cb0[1], ray);
+      clip_w = dot(cb0[3], ray);
+   }
 
    // 0x805A8981: max |xy| ; lt clip.w ; ge 0, clip.w ; or ; if_z
    const bool outside = clip_w <= max(abs(clip_x), abs(clip_y)) || clip_w <= 0.f;
    if (outside)
       return float2(0.f, 0.f); // movc falls back to the current UV => MV = 0
 
-   // 0x805A8981: div by clip.w ; mad (0.5,-0.5) + cb0[8].xy ; add 0.5
+   // 0x805A8981: div by clip.w ; mad (0.5,-0.5) ; add 0.5
+   // Note: cb0[8].xy (jitter) is removed so MVs are pure and jitter-free for DLSS
    const float2 ndc = float2(clip_x, clip_y) / clip_w;
-   const float2 reprojected_uv = ndc * float2(0.5f, -0.5f) + cb0[8].xy + 0.5f;
+   const float2 reprojected_uv = ndc * float2(0.5f, -0.5f) + 0.5f;
 
    // 0x805A8981: mad r1.xz, reproj, cb0[10].xy, -r1.xz ; add v1.xy
-   // r1.xz was neighbour_uv, so the +uv and -uv cancel out.
    const float2 history_uv = reprojected_uv * cb0[10].xy - neighbour * cb0[9].yz;
 
    return history_uv - uv;

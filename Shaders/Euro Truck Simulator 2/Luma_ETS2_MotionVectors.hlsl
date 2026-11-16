@@ -45,16 +45,32 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    float4 ray = float4(ray_xy, 1.f, 1.f);
    ray.xyz *= -depth;
 
-   // Read GBuffer flags (SRV 15):
+   // Read GBuffer flags (SRV 15, R16G16B16A16_UINT):
    // 0x805A8981 lines 39 & 100-101: bit 13 of .w flags dynamic / vehicle geometry
+   // 0x805A8981 lines 39-42 & 67 & 262: bit 0 of .z flags rearview mirror reflection surfaces
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
+   const bool is_mirror = (gbuffer.z & 1u) != 0;
 
-   // In first-person cabin view, the interior/dashboard/hood is rigidly attached to the camera.
-   // Outside world begins beyond the windshield (depth > 3.5m).
-   // Vehicle cabin uses pure-rotation reprojection (translation .w = 0) so driving forward has
-   // ZERO fake displacement, while turning head to check mirrors has exact angular motion!
-   const bool is_cabin = (depth < 3.5f) || (is_vehicle_flag && depth < 8.0f);
+   // 1. Rearview mirror reflection:
+   // Mirrors reflect the world behind the truck. Planar reflections have NO valid
+   // screen-space motion vectors from the main camera's depth buffer.
+   // If assigned cabin MV=(0,0), DLSS accumulates 16+ frames of moving reflection at 0 offset,
+   // causing heavy blur and ghosting.
+   // Returning an off-screen motion vector signals DLSS that history is disoccluded,
+   // forcing sharp, fresh current-frame reconstruction with ZERO temporal blur!
+   if (is_mirror)
+   {
+      return float2(2.0f, 2.0f);
+   }
+
+   // 2. Cabin / vehicle geometry:
+   // Rigidly attached to the camera in first-person view.
+   // Must ONLY use is_vehicle_flag within 8 meters.
+   // NEVER use a raw (depth < 3.5f) threshold without is_vehicle_flag, because the
+   // road directly in front of the truck (depth 1.5m~3.5m) would get MV=0,
+   // causing violent tearing and shaking against the rest of the road!
+   const bool is_cabin = is_vehicle_flag && (depth < 8.0f);
 
    float clip_x, clip_y, clip_w;
    if (is_cabin)

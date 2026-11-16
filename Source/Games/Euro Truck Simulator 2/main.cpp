@@ -66,8 +66,8 @@ static int g_bypass_ngx_ini = 0;
 static int g_source_slot_ini = 1; // 1 = slot 1 (current frame jittered colour in ETS2 #6128)
 static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
-static int g_use_game_jitter_ini = 1;
-static int g_invert_jitter_ini = 0;
+static int g_use_game_jitter_ini = 0; // 0 = off by default for rock-solid stability (pure jitter-free MV)
+static int g_invert_jitter_ini = 1;   // cb0[8] in ETS2 points opposite to projection jitter
 static float g_mvs_x_scale_ini = 1920.f;
 static float g_mvs_y_scale_ini = 1080.f;
 static int g_mvs_jittered_ini = 0;

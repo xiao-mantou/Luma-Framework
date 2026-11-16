@@ -48,14 +48,30 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    // Read GBuffer flags (SRV 15, R16G16B16A16_UINT):
    // Disassembly of ETS2 TAA resolve 0x805A8981:
    //   lines 39-42 & 101: bit 13 of .w flags vehicle / dynamic mesh geometry
+   //   lines 101, 170 & 296: bit 0 of .z flags valid temporal history (1 = static surface; 0 = dynamic mirror/screen)
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
+   const bool is_static_history = (gbuffer.z & 1u) != 0;
 
-   // 1. Cabin & vehicle geometry (dashboard, steering wheel, window pillars, mirrors):
-   // Rigidly attached to the camera in first-person view.
-   // Uses pure rotation reprojection (zero out camera translation) to keep the entire
-   // cabin rock solid. Mirrors are also stabilized so they don't jitter with camera jitter.
+   // 1. Cabin geometry (dashboard, steering wheel, window pillars, mirror frames):
    const bool is_cabin = is_vehicle_flag && (depth < 8.0f);
+
+   // 2. Rearview mirror reflection surface (physical mirror glass + electronic mirror screens):
+   // Rigidly attached to the vehicle, but flagged with (gbuffer.z & 1) == 0 (dynamic reflection content).
+   const bool is_mirror_glass = is_cabin && !is_static_history;
+
+   // Check if the truck is translating in world space:
+   const float speed_sq = dot(cb0[0].w, cb0[0].w) + dot(cb0[1].w, cb0[1].w) + dot(cb0[2].w, cb0[2].w);
+   const bool is_truck_moving = speed_sq > 1e-5f;
+
+   // When the truck is moving, the reflection inside the mirror moves independently of the cabin.
+   // Returning an off-screen motion vector (2.0, 2.0) forces DLSS to disocclude the moving reflection,
+   // completely eliminating temporal smear and motion blur on the mirror glass!
+   // When stationary, it seamlessly falls through to cabin pure-rotation MV to cancel camera jitter!
+   if (is_mirror_glass && is_truck_moving)
+   {
+      return float2(2.0f, 2.0f);
+   }
 
    float clip_x, clip_y, clip_w;
    if (is_cabin)

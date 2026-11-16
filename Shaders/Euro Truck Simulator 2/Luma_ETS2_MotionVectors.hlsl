@@ -47,31 +47,16 @@ float2 main(float4 pos : SV_Position) : SV_Target0
 
    // Read GBuffer flags (SRV 15, R16G16B16A16_UINT):
    // Disassembly of ETS2 TAA resolve 0x805A8981:
-   //   lines 39-42 & 101: bit 13 of .w flags vehicle / dynamic mesh geometry
-   //   lines 101, 170 & 296: bit 0 of .z flags rearview mirror reflection / dynamic screen
+   //   bit 13 of .w flags vehicle / dynamic mesh geometry
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
 
-   // 1. Cabin geometry (dashboard, steering wheel, window pillars, mirror frames):
+   // Cabin & mirror geometry:
+   // With DLSS Reactive Mask (draw.bias_mask / pInBiasCurrentColorMask) active,
+   // mirror reflections are refreshed via NVIDIA's official Reactive channel.
+   // The entire cabin (dashboard, pillars, mirror frames and mirror glass) shares
+   // uniform pure-rotation reprojection and jitter cancellation for zero vibration.
    const bool is_cabin = is_vehicle_flag && (depth < 8.0f);
-
-   // 2. Rearview mirror reflection surface (physical mirror glass + electronic mirror screens):
-   // Marked with (gbuffer.z & 1) != 0 for mirror reflections / dynamic screens.
-   const bool is_mirror_glass = is_cabin && ((gbuffer.z & 1u) != 0u);
-
-   // Check if the truck is translating in world space:
-   // Includes a small deadzone (~0.02m per frame, speed_sq > 0.0004) to avoid triggering on idle engine rumble/vibration.
-   const float speed_sq = cb0[0].w * cb0[0].w + cb0[1].w * cb0[1].w + cb0[2].w * cb0[2].w;
-   const bool is_truck_moving = speed_sq > 0.0004f;
-
-   // When the truck is moving, the reflection inside the mirror moves independently of the cabin.
-   // Returning an off-screen motion vector (2.0, 2.0) forces DLSS to disocclude the moving reflection,
-   // completely eliminating temporal smear and motion blur on the mirror glass!
-   // When stationary, it seamlessly falls through to cabin pure-rotation MV to cancel camera jitter!
-   if (is_mirror_glass && is_truck_moving)
-   {
-      return float2(2.0f, 2.0f);
-   }
 
    float clip_x, clip_y, clip_w;
    if (is_cabin)

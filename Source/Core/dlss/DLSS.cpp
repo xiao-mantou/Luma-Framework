@@ -409,6 +409,10 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
 	eval_params.InMVScaleY = custom_data->settings_data.mvs_y_scale;
 	eval_params.InJitterOffsetX = draw_data.jitter_x;
 	eval_params.InJitterOffsetY = draw_data.jitter_y;
+	if (draw_data.bias_mask)
+	{
+		eval_params.pInBiasCurrentColorMask = draw_data.bias_mask;
+	}
 
 	NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(
 		command_list,

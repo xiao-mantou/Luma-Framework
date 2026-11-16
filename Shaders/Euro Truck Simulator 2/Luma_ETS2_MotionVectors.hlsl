@@ -46,31 +46,31 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    ray.xyz *= -depth;
 
    // Read GBuffer flags (SRV 15, R16G16B16A16_UINT):
-   // 0x805A8981 lines 39 & 100-101: bit 13 of .w flags dynamic / vehicle geometry
-   // 0x805A8981 lines 39-42 & 67 & 262: bit 0 of .z flags rearview mirror reflection surfaces
+   // Disassembly of ETS2 TAA resolve 0x805A8981:
+   //   lines 39-42 & 101: bit 13 of .w flags vehicle / dynamic mesh geometry
+   //   lines 101, 170 & 296: bit 0 of .z flags valid temporal history (1 = static cabin interior; 0 = dynamic mirror reflection/screen)
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
-   const bool is_mirror = (gbuffer.z & 1u) != 0;
+   const bool has_valid_history = (gbuffer.z & 1u) != 0;
 
-   // 1. Rearview mirror reflection:
-   // Mirrors reflect the world behind the truck. Planar reflections have NO valid
-   // screen-space motion vectors from the main camera's depth buffer.
+   // 1. Rearview mirror reflections (physical mirrors + electronic mirror displays):
+   // Mirrors display the world behind the truck. Planar reflections have NO valid
+   // camera-space motion vectors from the main depth buffer.
+   // ETS2's original TAA flags mirrors with (gbuffer.z & 1) == 0 (invalid history) to bypass TAA.
    // If assigned cabin MV=(0,0), DLSS accumulates 16+ frames of moving reflection at 0 offset,
-   // causing heavy blur and ghosting.
-   // Returning an off-screen motion vector signals DLSS that history is disoccluded,
-   // forcing sharp, fresh current-frame reconstruction with ZERO temporal blur!
+   // causing heavy smear, blur and ghosting.
+   // Returning an off-screen motion vector (2.0, 2.0) signals DLSS that history is disoccluded,
+   // forcing sharp, fresh current-frame reconstruction with ZERO temporal smear!
+   const bool is_mirror = (!has_valid_history && (depth < 3.5f || (is_vehicle_flag && depth < 8.0f)));
    if (is_mirror)
    {
       return float2(2.0f, 2.0f);
    }
 
-   // 2. Cabin / vehicle geometry:
+   // 2. Cabin / vehicle geometry (dashboard, steering wheel, window pillars, mirror frames):
    // Rigidly attached to the camera in first-person view.
-   // Must ONLY use is_vehicle_flag within 8 meters.
-   // NEVER use a raw (depth < 3.5f) threshold without is_vehicle_flag, because the
-   // road directly in front of the truck (depth 1.5m~3.5m) would get MV=0,
-   // causing violent tearing and shaking against the rest of the road!
-   const bool is_cabin = is_vehicle_flag && (depth < 8.0f);
+   // Uses pure rotation reprojection (zero out camera translation) to keep the cabin rock solid.
+   const bool is_cabin = (is_vehicle_flag && has_valid_history && depth < 8.0f) || (has_valid_history && depth < 3.5f);
 
    float clip_x, clip_y, clip_w;
    if (is_cabin)

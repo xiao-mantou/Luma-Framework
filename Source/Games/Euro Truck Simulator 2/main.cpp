@@ -66,8 +66,9 @@ static int g_bypass_ngx_ini = 0;
 static int g_source_slot_ini = 1; // 1 = slot 1 (current frame jittered colour in ETS2 #6128)
 static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
-static int g_use_game_jitter_ini = 0; // 0 = off by default for rock-solid stability (pure jitter-free MV)
-static int g_invert_jitter_ini = 1;   // cb0[8] in ETS2 points opposite to projection jitter
+static int g_use_game_jitter_ini = 1;
+static int g_invert_jitter_x_ini = 0; // 0 = sign +1
+static int g_invert_jitter_y_ini = 0; // 0 = sign -1 (opposite to X in DirectX UV vs NDC)
 static float g_mvs_x_scale_ini = 1920.f;
 static float g_mvs_y_scale_ini = 1080.f;
 static int g_mvs_jittered_ini = 0;
@@ -95,7 +96,8 @@ struct ETS2DeviceData final : public GameDeviceData
    bool mark_dlaa_output = false; // debug: stamp a magenta block on our output
    uint32_t next_heartbeat_frame = 0;
    bool use_game_jitter = true;
-   bool invert_jitter = false;
+   bool invert_jitter_x = false;
+   bool invert_jitter_y = false;
    bool jitter_ok = false;
    float jitter_uv_x = 0.f;
    float jitter_uv_y = 0.f;
@@ -600,9 +602,10 @@ static bool ReadGameJitter(ID3D11Device* device, ID3D11DeviceContext* ctx, ETS2D
    // Reject implausible values so a wrong offset never feeds garbage to NGX.
    if (fabsf(uv_x) > 0.5f || fabsf(uv_y) > 0.5f)
       return false;
-   const float sign = gd.invert_jitter ? -1.f : 1.f;
-   out_x = sign * uv_x * static_cast<float>(w);
-   out_y = sign * uv_y * static_cast<float>(h);
+   const float sign_x = gd.invert_jitter_x ? -1.f : 1.f;
+   const float sign_y = gd.invert_jitter_y ? 1.f : -1.f; // DirectX UV Y is inverted relative to NDC Y
+   out_x = sign_x * uv_x * static_cast<float>(w);
+   out_y = sign_y * uv_y * static_cast<float>(h);
    gd.jitter_px_x = out_x;
    gd.jitter_px_y = out_y;
    return true;
@@ -1188,7 +1191,8 @@ public:
       gd->keep_engine_resolve = g_keep_engine_resolve_ini != 0;
       gd->mark_dlaa_output = g_mark_dlaa_output_ini != 0;
       gd->use_game_jitter = g_use_game_jitter_ini != 0;
-      gd->invert_jitter = g_invert_jitter_ini != 0;
+      gd->invert_jitter_x = g_invert_jitter_x_ini != 0;
+      gd->invert_jitter_y = g_invert_jitter_y_ini != 0;
       gd->mvs_x_scale = g_mvs_x_scale_ini;
       gd->mvs_y_scale = g_mvs_y_scale_ini;
       gd->mvs_jittered = g_mvs_jittered_ini != 0;
@@ -1287,7 +1291,8 @@ public:
       // New key: the old UseGameJitter=0 left over from A/B testing must not
       // silently disable jitter on the next launch.
       reshade::get_config_value(runtime, NAME, "UseGameJitterV2", g_use_game_jitter_ini);
-      reshade::get_config_value(runtime, NAME, "InvertJitter", g_invert_jitter_ini);
+      reshade::get_config_value(runtime, NAME, "InvertJitterX", g_invert_jitter_x_ini);
+      reshade::get_config_value(runtime, NAME, "InvertJitterY", g_invert_jitter_y_ini);
       reshade::get_config_value(runtime, NAME, "MvsXScale", g_mvs_x_scale_ini);
       reshade::get_config_value(runtime, NAME, "MvsYScale", g_mvs_y_scale_ini);
       reshade::get_config_value(runtime, NAME, "MvsJittered", g_mvs_jittered_ini);
@@ -1332,10 +1337,16 @@ public:
          int value = game_device_data.use_game_jitter ? 1 : 0;
          reshade::set_config_value(runtime, NAME, "UseGameJitterV2", value);
       }
-      if (ImGui::Checkbox("Invert jitter sign", &game_device_data.invert_jitter))
+      if (ImGui::Checkbox("Invert jitter X (+/-)", &game_device_data.invert_jitter_x))
       {
-         int value = game_device_data.invert_jitter ? 1 : 0;
-         reshade::set_config_value(runtime, NAME, "InvertJitter", value);
+         int value = game_device_data.invert_jitter_x ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "InvertJitterX", value);
+      }
+      ImGui::SameLine();
+      if (ImGui::Checkbox("Invert jitter Y (+/-)", &game_device_data.invert_jitter_y))
+      {
+         int value = game_device_data.invert_jitter_y ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "InvertJitterY", value);
       }
       ImGui::Text("depth %ux%u fmt=%d depth_func=%d reversed_z=%d captured=%d", game_device_data.depth_w,
          game_device_data.depth_h, game_device_data.depth_format, game_device_data.depth_func,
@@ -1375,9 +1386,10 @@ public:
          reshade::set_config_value(runtime, NAME, "MvsJittered", value);
       }
       ImGui::Text("mv pass: %s", game_device_data.mv_ready ? "active" : "inactive");
-      ImGui::Text("jitter uv=(%.6f,%.6f) px=(%.3f,%.3f) first=%u ok=%d", game_device_data.jitter_uv_x,
+      ImGui::Text("jitter uv=(%.6f,%.6f) px=(%.3f,%.3f) signs=(%.0f,%.0f) ok=%d", game_device_data.jitter_uv_x,
          game_device_data.jitter_uv_y, game_device_data.jitter_px_x, game_device_data.jitter_px_y,
-         game_device_data.jitter_first, game_device_data.jitter_ok ? 1 : 0);
+         game_device_data.invert_jitter_x ? -1.f : 1.f, game_device_data.invert_jitter_y ? 1.f : -1.f,
+         game_device_data.jitter_ok ? 1 : 0);
       if (ImGui::Checkbox("Mark our output (magenta block, proves overwrite)", &game_device_data.mark_dlaa_output))
       {
          int value = game_device_data.mark_dlaa_output ? 1 : 0;

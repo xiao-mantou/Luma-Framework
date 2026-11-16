@@ -51,23 +51,10 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
 
-   // 1. Rearview mirror reflections (physical mirrors + electronic mirror displays):
-   // Mirrors display the world behind the truck. Planar reflections have NO valid
-   // camera-space motion vectors from the main depth buffer.
-   // Mirrors are located strictly at the left/right window edges (uv.x < 0.28 or > 0.72)
-   // or top curb mirror (uv.y < 0.22 && uv.x > 0.45 && uv.x < 0.75), within near depth (< 3.5m).
-   // Center area (0.28 <= uv.x <= 0.72) is strictly the driver cabin and windscreen road;
-   // never mark center pixels as mirrors so the cabin gets full DLAA temporal accumulation!
-   const bool in_mirror_rect = (uv.x < 0.28f || uv.x > 0.72f || (uv.y < 0.22f && uv.x > 0.45f && uv.x < 0.75f));
-   const bool is_mirror = is_vehicle_flag && in_mirror_rect && (depth < 3.5f);
-   if (is_mirror)
-   {
-      return float2(2.0f, 2.0f);
-   }
-
-   // 2. Cabin / vehicle geometry (dashboard, steering wheel, window pillars, mirror frames):
+   // 1. Cabin & vehicle geometry (dashboard, steering wheel, window pillars, mirrors):
    // Rigidly attached to the camera in first-person view.
-   // Uses pure rotation reprojection (zero out camera translation) to keep the cabin rock solid.
+   // Uses pure rotation reprojection (zero out camera translation) to keep the entire
+   // cabin rock solid. Mirrors are also stabilized so they don't jitter with camera jitter.
    const bool is_cabin = is_vehicle_flag && (depth < 8.0f);
 
    float clip_x, clip_y, clip_w;

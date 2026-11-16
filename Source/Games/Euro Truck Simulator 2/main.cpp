@@ -946,8 +946,8 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    if (!logged_scale)
    {
       logged_scale = true;
-      const std::string scale_msg = "[ETS2 DLAA] mvs_scale (" + std::to_string(scale_x) + ", " +
-                                    std::to_string(scale_y) + ") res " + std::to_string(w) + "x" + std::to_string(h);
+      const std::string scale_msg = "[ETS2 DLAA] mvs_scale (" + std::to_string(gd.mvs_x_scale) + ", " +
+                                    std::to_string(gd.mvs_y_scale) + ") res " + std::to_string(w) + "x" + std::to_string(h);
       reshade::log::message(reshade::log::level::warning, scale_msg.c_str());
    }
    if (!impl->UpdateSettings(instance, ctx, settings))

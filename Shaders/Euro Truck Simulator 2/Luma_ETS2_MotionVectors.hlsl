@@ -60,21 +60,20 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    //     in front of the truck is >3.8m away, so depth < 2.0m will never touch the road).
    const bool is_cabin = (is_vehicle_flag && depth < 8.0f) || (depth < 2.0f);
 
-   float clip_x, clip_y, clip_w;
    if (is_cabin)
    {
-      // Pure rotation reprojection: zero out translation column (.w = 0)
-      clip_x = dot(float4(cb0[0].xyz, 0.f), ray);
-      clip_y = dot(float4(cb0[1].xyz, 0.f), ray);
-      clip_w = dot(float4(cb0[3].xyz, 0.f), ray);
+      // Original ETS2 0x805A8981 (disassembly lines 68 & 120-121):
+      // For vehicle interior and cabin geometry, the engine samples previous frame at v1.xy directly.
+      // The cabin is rigidly attached to the camera, so its relative physical displacement is 0.
+      // Returning cb0[8].xy (camera projection jitter) perfectly cancels sub-pixel vibration while
+      // ensuring 0 fake displacement during driving, road bumps, acceleration, and steering.
+      return cb0[8].xy;
    }
-   else
-   {
-      // Full camera reprojection (translation + rotation) for the outside world
-      clip_x = dot(cb0[0], ray);
-      clip_y = dot(cb0[1], ray);
-      clip_w = dot(cb0[3], ray);
-   }
+
+   // Full camera reprojection (translation + rotation) for the outside world
+   const float clip_x = dot(cb0[0], ray);
+   const float clip_y = dot(cb0[1], ray);
+   const float clip_w = dot(cb0[3], ray);
 
    // 0x805A8981: max |xy| ; lt clip.w ; ge 0, clip.w ; or ; if_z
    const bool outside = clip_w <= max(abs(clip_x), abs(clip_y)) || clip_w <= 0.f;

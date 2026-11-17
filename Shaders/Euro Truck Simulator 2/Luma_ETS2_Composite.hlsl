@@ -23,29 +23,21 @@ float4 main(float4 pos : SV_Position) : SV_Target0
    const int2 pixel = int2(pos.xy);
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle = ((gbuffer.w >> 13) & 1u) != 0u;
+   const bool is_frit_dots = is_vehicle && ((gbuffer.z & 1u) != 0u);
 
    const float4 dlaa = DlaaTexture.Load(int3(pixel, 0));
 
-   // Fast path: outside world pixels bypass interior checks completely
-   if (!is_vehicle)
+   // Fast path: outside world AND windshield frit dots receive 100% full DLAA.
+   // Frit dots now have proper camera reprojected motion vectors, so DLAA temporally
+   // anti-aliases them smoothly with zero motion blur or jitter.
+   if (!is_vehicle || is_frit_dots)
    {
       return dlaa;
    }
 
-   // Boundary & Glass Frit (波点) detection:
-   // Sample 4 cardinal neighbours to detect transitions between vehicle and window/outside.
-   const uint v_r = (GBufferFlags.Load(int3(pixel + int2( 1,  0), 0)).w >> 13) & 1u;
-   const uint v_l = (GBufferFlags.Load(int3(pixel + int2(-1,  0), 0)).w >> 13) & 1u;
-   const uint v_d = (GBufferFlags.Load(int3(pixel + int2( 0,  1), 0)).w >> 13) & 1u;
-   const uint v_u = (GBufferFlags.Load(int3(pixel + int2( 0, -1), 0)).w >> 13) & 1u;
-   const uint v_sum = v_r + v_l + v_d + v_u;
-
-   // If on boundary/frit dots (v_sum < 4), apply DLAA to eliminate harsh stippling and staircase jaggies.
-   // Deep inside the cabin (v_sum == 4), edge_dlaa is 0.0, strictly following user blend.
-   const float edge_dlaa = float(4u - v_sum) * 0.25f;
+   // Cabin interior (steering wheel, dashboard, doors, excluding frit dots):
+   // Default blend is 0.0 (pure sharp native current frame).
    const float blend = saturate(cb0[14].y);
-   const float effective_blend = max(blend, edge_dlaa);
-
    const float4 native_src = NativeSourceTexture.Load(int3(pixel, 0));
-   return lerp(native_src, dlaa, effective_blend);
+   return lerp(native_src, dlaa, blend);
 }

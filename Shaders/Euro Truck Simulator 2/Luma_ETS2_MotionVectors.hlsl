@@ -29,13 +29,17 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    // Read GBuffer flags (SRV 15, R16G16B16A16_UINT):
    // Disassembly of ETS2 TAA resolve 0x805A8981:
    //   bit 13 of .w flags vehicle / dynamic mesh geometry
+   //   bit 0  of .z flags windshield ceramic frit dots (波点)
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
+   const bool is_frit_dots = is_vehicle_flag && ((gbuffer.z & 1u) != 0u);
 
-   // Cabin geometry: 100% governed by the verified vehicle flag (pure red)
-   const bool is_cabin = is_vehicle_flag;
+   // Cabin interior geometry: 100% governed by the verified vehicle flag,
+   // explicitly EXCLUDING the windshield ceramic frit dots so that frit dots
+   // can reproject with the camera and receive full DLAA anti-aliasing without blur.
+   const bool is_cabin_interior = is_vehicle_flag && !is_frit_dots;
 
-   if (is_cabin)
+   if (is_cabin_interior)
    {
       // The cockpit interior is stationary relative to the camera in driving.
       // Returning strictly (0, 0) provides an unjittered stationary vector to DLSS, eliminating

@@ -58,9 +58,9 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    if (is_cabin)
    {
       // The cockpit interior is stationary relative to the player's camera.
-      // Returning cb0[8].xy perfectly cancels the subpixel projection jitter,
-      // eliminating high-frequency edge ghosting without introducing world translation.
-      return cb0[8].xy;
+      // Outputting strictly (0, 0) provides an unjittered stationary vector to DLSS
+      // (DLSS already handles jitter via InJitterOffsetX/Y), completely eliminating jitter and false motion!
+      return float2(0.0f, 0.0f);
    }
 
    // Full camera reprojection (translation + rotation) for the outside world

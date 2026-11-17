@@ -63,6 +63,7 @@ static int g_cancel_taa_resolve_ini = 0;
 static int g_enable_dlaa_ini = 0;
 static int g_test_output_path_ini = 0;
 static int g_bypass_ngx_ini = 0;
+static int g_debug_view_mask_ini = 0;
 static int g_source_slot_ini = 1; // 1 = slot 1 (current frame jittered colour in ETS2 #6128)
 static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
@@ -84,6 +85,7 @@ struct ETS2DeviceData final : public GameDeviceData
    bool test_output_path = false;     // debug: copy a solid red texture instead of running DLSS
 #if ENABLE_SR
    bool bypass_ngx = false; // debug: copy the colour SRV straight into RTV0
+   bool debug_view_mask = false; // debug: visualize GBuffer flags and depth on screen
    int source_slot = -1;    // -1 = auto
    int resolved_source_slot = 0;
    bool source_equals_output = false; // true => NGX would read back its own output
@@ -941,6 +943,55 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
       return true;
    }
 
+   // Debug: visualize GBuffer flags and packed depth directly on screen
+   if (gd.debug_view_mask)
+   {
+      float dummy_jx = 0.f, dummy_jy = 0.f;
+      ReadGameJitter(device, ctx, gd, w, h, dummy_jx, dummy_jy);
+      if (!gd.game_cb)
+      {
+         D3D11_BUFFER_DESC bd = {};
+         bd.ByteWidth = 256;
+         bd.Usage = D3D11_USAGE_DYNAMIC;
+         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+         device->CreateBuffer(&bd, nullptr, &gd.game_cb);
+      }
+      if (gd.game_cb)
+      {
+         D3D11_MAPPED_SUBRESOURCE m = {};
+         if (SUCCEEDED(ctx->Map(gd.game_cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+         {
+            float* dst = static_cast<float*>(m.pData);
+            for (int i = 0; i < 64; ++i)
+               dst[i] = gd.game_cb0[i];
+            ctx->Unmap(gd.game_cb.get(), 0);
+         }
+      }
+      const auto vs_it = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
+      const auto ps_it = device_data.native_pixel_shaders.find(CompileTimeStringHash("ETS2 Debug Mask"));
+      if (vs_it != device_data.native_vertex_shaders.end() && vs_it->second &&
+          ps_it != device_data.native_pixel_shaders.end() && ps_it->second && srvs[15] && srvs[4])
+      {
+         DrawStateStack<DrawStateStackType::FullGraphics> state_stack;
+         state_stack.Cache(ctx, device_data.uav_max_count);
+         if (gd.game_cb)
+         {
+            ID3D11Buffer* cb = gd.game_cb.get();
+            ctx->PSSetConstantBuffers(0, 1, &cb);
+         }
+         ID3D11ShaderResourceView* dbg_srvs[2] = { srvs[4].get(), source_color.get() };
+         ctx->PSSetShaderResources(1, 2, dbg_srvs);
+         DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
+            nullptr, vs_it->second.get(), ps_it->second.get(), srvs[15].get(), rtv.get(),
+            w, h, false, "ETS2 Debug Mask");
+         state_stack.Restore(ctx);
+         SetSrStatus(gd, "Debug View Mask: active (visualizing GBuffer & Depth)");
+         gd.dlaa_drew_this_frame = true;
+         return true;
+      }
+   }
+
    if (!gd.zero_mv || !gd.const_depth)
    {
       D3D11_TEXTURE2D_DESC d = {};
@@ -1186,6 +1237,8 @@ public:
          ShaderDefinition{"Luma_ETS2_MotionVectors", reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("ETS2 Mirror Mask"),
          ShaderDefinition{"Luma_ETS2_MirrorMask", reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("ETS2 Debug Mask"),
+         ShaderDefinition{"Luma_ETS2_DebugMask", reshade::api::pipeline_subobject_type::pixel_shader});
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES); // Make sure there's room for at least one extra custom define to add for development (this isn't really relevant outside of development)
 
       // Define these according to the game's original technical details and the mod's implementation (see their declarations for more).
@@ -1228,6 +1281,7 @@ public:
       gd->test_output_path = g_test_output_path_ini != 0;
 #if ENABLE_SR
       gd->bypass_ngx = g_bypass_ngx_ini != 0;
+      gd->debug_view_mask = g_debug_view_mask_ini != 0;
       gd->source_slot = g_source_slot_ini;
       gd->keep_engine_resolve = g_keep_engine_resolve_ini != 0;
       gd->mark_dlaa_output = g_mark_dlaa_output_ini != 0;
@@ -1327,6 +1381,7 @@ public:
       reshade::get_config_value(runtime, NAME, "EnableDlaa", g_enable_dlaa_ini);
       reshade::get_config_value(runtime, NAME, "TestOutputPath", g_test_output_path_ini);
       reshade::get_config_value(runtime, NAME, "BypassNgx", g_bypass_ngx_ini);
+      reshade::get_config_value(runtime, NAME, "DebugViewMask", g_debug_view_mask_ini);
       reshade::get_config_value(runtime, NAME, "SourceSlot", g_source_slot_ini);
       reshade::get_config_value(runtime, NAME, "KeepEngineResolve", g_keep_engine_resolve_ini);
       reshade::get_config_value(runtime, NAME, "MarkDlaaOutput", g_mark_dlaa_output_ini);
@@ -1368,6 +1423,11 @@ public:
       {
          int value = game_device_data.bypass_ngx ? 1 : 0;
          reshade::set_config_value(runtime, NAME, "BypassNgx", value);
+      }
+      if (ImGui::Checkbox("Debug View Mask (Color-coded GBuffer & Depth)", &game_device_data.debug_view_mask))
+      {
+         int value = game_device_data.debug_view_mask ? 1 : 0;
+         reshade::set_config_value(runtime, NAME, "DebugViewMask", value);
       }
       if (ImGui::Checkbox("Keep engine TAA resolve (then overwrite RTV0)", &game_device_data.keep_engine_resolve))
       {

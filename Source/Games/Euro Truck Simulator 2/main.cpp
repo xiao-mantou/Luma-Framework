@@ -58,42 +58,6 @@
 
 // PS hash of the TAA temporal resolve to be replaced by DLAA.
 static constexpr uint32_t kTaaResolvePS = 0x805A8981u;
-// PS hashes for rearview mirror / electronic mirror mesh drawing into GBuffer.
-static constexpr uint32_t kMirrorPS = 0x2DF23CD6u;
-static constexpr uint32_t kMirrorPSAlt = 0xE7159441u;
-
-// Precompiled bytecode (ps_5_0) for float4 main() : SV_Target0 { return float4(1.0f, 1.0f, 1.0f, 1.0f); }
-static const BYTE g_solid_white_ps[] = {
-   68, 88, 66, 67, 122, 23, 193, 152, 29, 165, 96, 238, 83, 212, 179, 204,
-   157, 241, 159, 231, 1, 0, 0, 0, 208, 1, 0, 0, 5, 0, 0, 0,
-   52, 0, 0, 0, 172, 0, 0, 0, 188, 0, 0, 0, 240, 0, 0, 0,
-   52, 1, 0, 0, 82, 68, 69, 70, 112, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 60, 0, 0, 0, 0, 5, 255, 255,
-   0, 1, 0, 0, 60, 0, 0, 0, 82, 68, 49, 49, 60, 0, 0, 0,
-   24, 0, 0, 0, 32, 0, 0, 0, 40, 0, 0, 0, 36, 0, 0, 0,
-   12, 0, 0, 0, 0, 0, 0, 0, 77, 105, 99, 114, 111, 115, 111, 102,
-   116, 32, 40, 82, 41, 32, 72, 76, 83, 76, 32, 83, 104, 97, 100, 101,
-   114, 32, 67, 111, 109, 112, 105, 108, 101, 114, 32, 57, 46, 50, 57, 46,
-   57, 53, 50, 46, 51, 49, 49, 49, 0, 171, 171, 171, 73, 83, 71, 78,
-   8, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 79, 83, 71, 78,
-   44, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 32, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0,
-   15, 0, 0, 0, 83, 86, 95, 84, 97, 114, 103, 101, 116, 0, 171, 171,
-   83, 72, 69, 88, 60, 0, 0, 0, 80, 0, 0, 0, 15, 0, 0, 0,
-   106, 8, 0, 1, 101, 0, 0, 3, 242, 32, 16, 0, 0, 0, 0, 0,
-   54, 0, 0, 8, 242, 32, 16, 0, 0, 0, 0, 0, 2, 64, 0, 0,
-   0, 0, 128, 63, 0, 0, 128, 63, 0, 0, 128, 63, 0, 0, 128, 63,
-   62, 0, 0, 1, 83, 84, 65, 84, 148, 0, 0, 0, 2, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0
-};
 // LoadConfigs() has no DeviceData, so ini values are staged here and copied in OnCreateDevice().
 static int g_cancel_taa_resolve_ini = 0;
 static int g_enable_dlaa_ini = 0;
@@ -176,13 +140,9 @@ struct ETS2DeviceData final : public GameDeviceData
    com_ptr<ID3D11Texture2D> staging_source; // snapshot when source == output
    com_ptr<ID3D11Texture2D> bias_mask;      // DLSS reactive / bias mask (R8_UNORM) for rearview mirrors
    com_ptr<ID3D11RenderTargetView> bias_mask_rtv;
-   com_ptr<ID3D11PixelShader> mirror_mask_ps;
-   com_ptr<ID3D11BlendState> mirror_mask_blend_state;
    UINT bias_mask_w = 0;
    UINT bias_mask_h = 0;
-   bool bias_mask_cleared_this_frame = false;
-   uint32_t mirror_draw_hits = 0;
-   bool mirror_draw_logged = false;
+   bool bias_mask_logged = false;
    uint32_t sr_draws = 0;
    uint32_t sr_failures = 0;
    const char* sr_status = "off";
@@ -725,6 +685,41 @@ static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, D
    DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
       nullptr, vs_it->second.get(), ps_it->second.get(), packed_srv, gd.mv_rtv.get(),
       w, h, false, "ETS2 Motion Vectors");
+
+   // Build mirror & dynamic screen reactive mask from GBufferFlags (srvs[15], t15.z & 1)
+   if (gbuffer_srv)
+   {
+      if (!gd.bias_mask || gd.bias_mask_w != w || gd.bias_mask_h != h)
+      {
+         gd.bias_mask = nullptr;
+         gd.bias_mask_rtv = nullptr;
+         gd.bias_mask_w = w;
+         gd.bias_mask_h = h;
+         D3D11_TEXTURE2D_DESC td = {};
+         td.Width = w;
+         td.Height = h;
+         td.MipLevels = 1;
+         td.ArraySize = 1;
+         td.Format = DXGI_FORMAT_R8_UNORM;
+         td.SampleDesc.Count = 1;
+         td.Usage = D3D11_USAGE_DEFAULT;
+         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+         if (SUCCEEDED(device->CreateTexture2D(&td, nullptr, &gd.bias_mask)))
+         {
+            device->CreateRenderTargetView(gd.bias_mask.get(), nullptr, &gd.bias_mask_rtv);
+         }
+      }
+      if (gd.bias_mask_rtv)
+      {
+         const auto mask_ps_it = device_data.native_pixel_shaders.find(CompileTimeStringHash("ETS2 Mirror Mask"));
+         if (mask_ps_it != device_data.native_pixel_shaders.end() && mask_ps_it->second)
+         {
+            DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
+               nullptr, vs_it->second.get(), mask_ps_it->second.get(), gbuffer_srv, gd.bias_mask_rtv.get(),
+               w, h, false, "ETS2 Mirror Mask");
+         }
+      }
+   }
    state_stack.Restore(ctx);
 
    gd.mv_ready = true;
@@ -735,157 +730,6 @@ static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, D
       reshade::log::message(reshade::log::level::warning, msg.c_str());
    }
    return true;
-}
-
-static void DrawMirrorMask(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data,
-   ETS2DeviceData& gd, std::function<void()>* original_draw_dispatch_func)
-{
-   if (!gd.enable_dlaa || !original_draw_dispatch_func || !*original_draw_dispatch_func)
-      return;
-
-   UINT num_vp = 1;
-   D3D11_VIEWPORT vp = {};
-   ctx->RSGetViewports(&num_vp, &vp);
-
-   const UINT main_w = (gd.target_w > 0) ? gd.target_w : static_cast<UINT>(device_data.output_resolution.x);
-   const UINT main_h = (gd.target_h > 0) ? gd.target_h : static_cast<UINT>(device_data.output_resolution.y);
-
-   // Strictly match the main scene viewport dimensions.
-   // Filters out off-screen render passes (such as the 512x512 rearview mirror RT passes).
-   if (main_w > 0 && main_h > 0)
-   {
-      if (static_cast<UINT>(vp.Width) != main_w || static_cast<UINT>(vp.Height) != main_h)
-         return;
-   }
-   else
-   {
-      if (vp.Width < 1000.f || vp.Height < 700.f)
-         return;
-   }
-
-   const UINT w = (main_w > 0) ? main_w : static_cast<UINT>(vp.Width);
-   const UINT h = (main_h > 0) ? main_h : static_cast<UINT>(vp.Height);
-
-   if (!gd.bias_mask || gd.bias_mask_w != w || gd.bias_mask_h != h)
-   {
-      gd.bias_mask = nullptr;
-      gd.bias_mask_rtv = nullptr;
-      gd.bias_mask_w = w;
-      gd.bias_mask_h = h;
-
-      D3D11_TEXTURE2D_DESC td = {};
-      td.Width = w;
-      td.Height = h;
-      td.MipLevels = 1;
-      td.ArraySize = 1;
-      td.Format = DXGI_FORMAT_R8_UNORM;
-      td.SampleDesc.Count = 1;
-      td.Usage = D3D11_USAGE_DEFAULT;
-      td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-      if (FAILED(device->CreateTexture2D(&td, nullptr, &gd.bias_mask)) ||
-          FAILED(device->CreateRenderTargetView(gd.bias_mask.get(), nullptr, &gd.bias_mask_rtv)))
-      {
-         gd.bias_mask = nullptr;
-         gd.bias_mask_rtv = nullptr;
-         return;
-      }
-      gd.bias_mask_cleared_this_frame = false;
-   }
-
-   if (!gd.bias_mask_cleared_this_frame)
-   {
-      const float zero[4] = {0.f, 0.f, 0.f, 0.f};
-      ctx->ClearRenderTargetView(gd.bias_mask_rtv.get(), zero);
-      gd.bias_mask_cleared_this_frame = true;
-   }
-
-   if (!gd.mirror_mask_ps)
-   {
-      const auto ps_it = device_data.native_pixel_shaders.find(CompileTimeStringHash("ETS2 Mirror Mask"));
-      if (ps_it != device_data.native_pixel_shaders.end() && ps_it->second)
-      {
-         gd.mirror_mask_ps = ps_it->second.get();
-      }
-      else
-      {
-         device->CreatePixelShader(g_solid_white_ps, sizeof(g_solid_white_ps), nullptr, &gd.mirror_mask_ps);
-      }
-   }
-   if (!gd.mirror_mask_ps)
-      return;
-
-   if (!gd.mirror_mask_blend_state)
-   {
-      D3D11_BLEND_DESC bd = {};
-      bd.RenderTarget[0].BlendEnable = FALSE;
-      bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-      device->CreateBlendState(&bd, &gd.mirror_mask_blend_state);
-   }
-
-   ID3D11RenderTargetView* orig_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-   ID3D11DepthStencilView* orig_dsv = nullptr;
-   ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, orig_rtvs, &orig_dsv);
-
-   com_ptr<ID3D11PixelShader> orig_ps;
-   ctx->PSGetShader(&orig_ps, nullptr, nullptr);
-
-   com_ptr<ID3D11BlendState> orig_blend_state;
-   FLOAT orig_blend_factor[4] = {};
-   UINT orig_sample_mask = 0xFFFFFFFF;
-   ctx->OMGetBlendState(&orig_blend_state, orig_blend_factor, &orig_sample_mask);
-
-   com_ptr<ID3D11DepthStencilState> orig_ds_state;
-   UINT orig_stencil_ref = 0;
-   ctx->OMGetDepthStencilState(&orig_ds_state, &orig_stencil_ref);
-
-   D3D11_DEPTH_STENCIL_DESC dsd = {};
-   if (orig_ds_state)
-   {
-      orig_ds_state->GetDesc(&dsd);
-   }
-   else
-   {
-      dsd.DepthEnable = TRUE;
-      dsd.DepthFunc = (gd.inverted_depth != 0) ? D3D11_COMPARISON_GREATER_EQUAL : D3D11_COMPARISON_LESS_EQUAL;
-   }
-   dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; // Read-only depth test prevents leaking onto foreground occluders
-
-   com_ptr<ID3D11DepthStencilState> mask_ds_state;
-   device->CreateDepthStencilState(&dsd, &mask_ds_state);
-
-   ID3D11RenderTargetView* mask_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-   mask_rtvs[0] = gd.bias_mask_rtv.get();
-   ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, mask_rtvs, orig_dsv);
-   if (gd.mirror_mask_blend_state)
-      ctx->OMSetBlendState(gd.mirror_mask_blend_state.get(), nullptr, 0xFFFFFFFF);
-   if (mask_ds_state)
-      ctx->OMSetDepthStencilState(mask_ds_state.get(), orig_stencil_ref);
-   ctx->PSSetShader(gd.mirror_mask_ps.get(), nullptr, 0);
-
-   // Draw mirror mask
-   (*original_draw_dispatch_func)();
-
-   // Restore full pipeline state
-   ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, orig_rtvs, orig_dsv);
-   ctx->OMSetBlendState(orig_blend_state.get(), orig_blend_factor, orig_sample_mask);
-   ctx->OMSetDepthStencilState(orig_ds_state.get(), orig_stencil_ref);
-   ctx->PSSetShader(orig_ps.get(), nullptr, 0);
-
-   for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-   {
-      if (orig_rtvs[i])
-         orig_rtvs[i]->Release();
-   }
-   if (orig_dsv)
-      orig_dsv->Release();
-
-   ++gd.mirror_draw_hits;
-   if (!gd.mirror_draw_logged)
-   {
-      gd.mirror_draw_logged = true;
-      reshade::log::message(reshade::log::level::warning,
-         ("[ETS2 DLAA] mirror mask draw active res=" + std::to_string(w) + "x" + std::to_string(h)).c_str());
-   }
 }
 
 static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceData& device_data, ETS2DeviceData& gd)
@@ -1403,17 +1247,6 @@ public:
 #if ENABLE_SR
       if (!is_custom_pass)
          ProbeMainDepth(native_device_context, game_device_data);
-
-      if (original_shader_hashes.Contains(kMirrorPS, reshade::api::shader_stage::pixel) ||
-          original_shader_hashes.Contains(kMirrorPSAlt, reshade::api::shader_stage::pixel))
-      {
-         if (game_device_data.enable_dlaa && original_draw_dispatch_func && *original_draw_dispatch_func)
-         {
-            DrawMirrorMask(native_device, native_device_context, device_data, game_device_data, original_draw_dispatch_func);
-            (*original_draw_dispatch_func)();
-            return DrawOrDispatchOverrideType::Replaced;
-         }
-      }
 #endif
       // v1 probe: verify Luma's shader hash matches the DevKit hash of the TAA
       // resolve. If this counter stays at 0, the hash needs re-dumping with a
@@ -1435,7 +1268,7 @@ public:
                                    " slot=" + std::to_string(game_device_data.resolved_source_slot) +
                                    " same=" + std::to_string(game_device_data.source_equals_output ? 1 : 0) +
                                    " dsv=" + std::to_string(game_device_data.depth_w) + "x" + std::to_string(game_device_data.depth_h) +
-                                   " mask=" + std::to_string(game_device_data.mirror_draw_hits) +
+                                   " mask=" + std::to_string(game_device_data.bias_mask ? 1 : 0) +
                                    " invz=" + std::to_string(game_device_data.inverted_depth);
             reshade::log::message(reshade::log::level::warning, hb.c_str());
          }
@@ -1480,7 +1313,6 @@ public:
 
       game_device_data.has_drawn_taa_resolve = false;
       game_device_data.dlaa_drew_this_frame = false;
-      game_device_data.bias_mask_cleared_this_frame = false;
       ++game_device_data.frame_index;
    }
 
@@ -1525,7 +1357,7 @@ public:
          reshade::set_config_value(runtime, NAME, "EnableDlaa", value);
       }
       ImGui::Text("DLAA draws: %u  failures: %u", game_device_data.sr_draws, game_device_data.sr_failures);
-      ImGui::Text("Mirror mask hits: %u", game_device_data.mirror_draw_hits);
+      ImGui::Text("Mirror reactive mask: %s", game_device_data.bias_mask ? "active" : "off");
       ImGui::Text("status: %s", game_device_data.sr_status);
       if (ImGui::Checkbox("Test output path (solid red, skips DLSS)", &game_device_data.test_output_path))
       {

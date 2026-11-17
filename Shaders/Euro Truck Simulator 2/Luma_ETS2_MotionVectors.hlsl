@@ -60,20 +60,26 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    //     in front of the truck is >3.8m away, so depth < 2.0m will never touch the road).
    const bool is_cabin = (is_vehicle_flag && depth < 8.0f) || (depth < 2.0f);
 
+   float clip_x, clip_y, clip_w;
    if (is_cabin)
    {
-      // Original ETS2 0x805A8981 (disassembly lines 68 & 120-121):
-      // For vehicle interior and cabin geometry, the engine samples previous frame at v1.xy directly.
-      // The cabin is rigidly attached to the camera, so its relative physical displacement is 0.
-      // Returning cb0[8].xy (camera projection jitter) perfectly cancels sub-pixel vibration while
-      // ensuring 0 fake displacement during driving, road bumps, acceleration, and steering.
-      return cb0[8].xy;
+      // Pure rotation with unit-depth ray (w = 0 strips translation).
+      // ray.xyz was -depth * (ray_xy, 1.0f).
+      // With depth = 1.0f and w = 0, unit_ray is (-ray_xy, -1.0f, 0.0f).
+      // Stripping translation (.w = 0) eliminates world forward motion, while
+      // preserving exact angular motion for head rotation and braking/sway pitch.
+      const float4 unit_ray = float4(-ray_xy, -1.f, 0.f);
+      clip_x = dot(cb0[0], unit_ray);
+      clip_y = dot(cb0[1], unit_ray);
+      clip_w = max(dot(cb0[3], unit_ray), 1e-4f);
    }
-
-   // Full camera reprojection (translation + rotation) for the outside world
-   const float clip_x = dot(cb0[0], ray);
-   const float clip_y = dot(cb0[1], ray);
-   const float clip_w = dot(cb0[3], ray);
+   else
+   {
+      // Full camera reprojection (translation + rotation) for the outside world
+      clip_x = dot(cb0[0], ray);
+      clip_y = dot(cb0[1], ray);
+      clip_w = dot(cb0[3], ray);
+   }
 
    // 0x805A8981: max |xy| ; lt clip.w ; ge 0, clip.w ; or ; if_z
    const bool outside = clip_w <= max(abs(clip_x), abs(clip_y)) || clip_w <= 0.f;

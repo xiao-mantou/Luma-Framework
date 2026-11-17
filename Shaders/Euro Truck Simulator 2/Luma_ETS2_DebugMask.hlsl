@@ -1,21 +1,14 @@
-// ETS2 DLAA: Debug Visual Mask for inspecting GBuffer Flags and Depth
+// ETS2 DLAA: Debug Visual Mask for inspecting GBuffer Flags, Depth, and Rearview Mirror
 //
 // Inputs:
 //   t0 = SRV15, R16G16B16A16_UINT GBuffer flags written by geometry pass
-//          .w [bit 13] dynamic / vehicle object flag (0x805A8981 disasm line 39 & 100)
-//          .z [bit 0]  material flag (not mirror)
-//   t1 = SRV4,  R16G16_UINT written by #6127 (0xB824672E) - Packed Depth
-//          .x = log2(minDepth + 1) * 4096.118164
-//   t2 = SRV1,  RGBA16F original jittered scene color (used if BLEND_OVER_GAME == 1)
+//          .w [bit 13] vehicle / cockpit geometry flag
+//          .w [bit 14..15] secondary vehicle / dynamic bits
+//          .z [bit 0]  material flag / dynamic surface (t15.z & 1)
+//          .z [bit 1]  secondary material flag (t15.z & 2)
+//   t1 = SRV4,  R16G16_UINT Packed Depth
+//   t2 = SRV1,  RGBA16F live scene color (for semi-transparent overlay)
 //   b0 = GameCB0 (16 x float4)
-
-// -----------------------------------------------------------------------------
-// Interactive switches (Hot-reloadable! Change and save to see changes in game)
-// -----------------------------------------------------------------------------
-#define SHOW_VEHICLE_RED      1    // 1 = Show vehicle flag ((t15.w >> 13) & 1) in RED
-#define SHOW_MATERIAL_GREEN   0    // 0 = Turn off material flag (t15.z & 1) per user observation
-#define SHOW_DEPTH_BLUE       0    // 0 = Turn off depth < 2.0m per user observation (pure red interior)
-#define BLEND_OVER_GAME       0    // Set to 1 to blend mask with live game scene (50% opacity)
 
 cbuffer GameCB0 : register(b0)
 {
@@ -30,38 +23,57 @@ float4 main(float4 pos : SV_Position) : SV_Target0
 {
    const int2 pixel = int2(pos.xy);
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
-   const uint2 packed = PackedDepth.Load(int3(pixel, 0));
 
-   // 0x805A8981 depth decode:
-   const float depth = exp2(float(packed.x) * (1.f / 4096.118164f)) - 1.f;
+   const bool flag_w13 = ((gbuffer.w >> 13) & 1u) != 0u; // Standard vehicle flag
+   const bool flag_z0  = ((gbuffer.z & 1u) != 0u);        // Material flag / dynamic flag
+   const bool flag_w14 = ((gbuffer.w >> 14) & 1u) != 0u; // Secondary w flag
+   const bool flag_z1  = ((gbuffer.z & 2u) != 0u);        // Secondary z flag
 
-   // Flags from GBuffer:
-   const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0u;
-   const bool is_material_flag = ((gbuffer.z & 1u) != 0u);
-   const bool is_close_depth  = (depth < 2.0f);
-
-   float3 mask_color = float3(0.0f, 0.0f, 0.0f);
-
-#if SHOW_VEHICLE_RED
-   if (is_vehicle_flag)
-      mask_color.r = 1.0f;
-#endif
-
-#if SHOW_MATERIAL_GREEN
-   if (is_material_flag)
-      mask_color.g = 1.0f;
-#endif
-
-#if SHOW_DEPTH_BLUE
-   if (is_close_depth)
-      mask_color.b = 1.0f;
-#endif
-
-#if BLEND_OVER_GAME
+   // Live scene underlay
    const float4 scene = SceneColor.Load(int3(pixel, 0));
-   const float3 blended = lerp(scene.rgb, mask_color, 0.60f);
-   return float4(blended, 1.0f);
-#else
-   return float4(mask_color, 1.0f);
-#endif
+
+   // Color encoding:
+   //   - RED: Standard Vehicle interior (w13 == 1, z0 == 0)
+   //   - YELLOW / GOLD: Vehicle with material flag z0 (w13 == 1, z0 == 1)
+   //   - GREEN: Pure Material flag without vehicle (w13 == 0, z0 == 1)
+   //   - CYAN: Secondary w14 flag
+   //   - MAGENTA: Secondary z1 flag
+   //   - UNMODIFIED SCENE: Neither flag is set (e.g. outside world, sky, forward transparent glass)
+   float3 mask_color = float3(0.0f, 0.0f, 0.0f);
+   bool has_highlight = false;
+
+   if (flag_w13 && !flag_z0)
+   {
+      mask_color = float3(1.0f, 0.0f, 0.0f); // RED: Cabin interior
+      has_highlight = true;
+   }
+   else if (flag_w13 && flag_z0)
+   {
+      mask_color = float3(1.0f, 0.85f, 0.0f); // YELLOW / GOLD: Vehicle with material flag z0
+      has_highlight = true;
+   }
+   else if (!flag_w13 && flag_z0)
+   {
+      mask_color = float3(0.0f, 1.0f, 0.0f); // GREEN: Material flag z0 only
+      has_highlight = true;
+   }
+   else if (flag_w14)
+   {
+      mask_color = float3(0.0f, 1.0f, 1.0f); // CYAN: w14
+      has_highlight = true;
+   }
+   else if (flag_z1)
+   {
+      mask_color = float3(1.0f, 0.0f, 1.0f); // MAGENTA: z1
+      has_highlight = true;
+   }
+
+   if (has_highlight)
+   {
+      // 55% opacity blend over live game scene so user can see what mesh is being highlighted
+      return float4(lerp(scene.rgb, mask_color, 0.55f), 1.0f);
+   }
+
+   // No flags: show original game scene
+   return scene;
 }

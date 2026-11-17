@@ -51,27 +51,21 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
 
-   // Cabin geometry:
-   const bool is_cabin = (is_vehicle_flag && depth < 8.0f) || (depth < 2.0f);
+   // Cabin geometry: vehicle flag combined with near depth (< 2.5m) to strictly
+   // isolate the cockpit interior while leaving external AI traffic to world reprojection.
+   const bool is_cabin = is_vehicle_flag && (depth < 2.5f);
 
-   float clip_x, clip_y, clip_w;
    if (is_cabin)
    {
-      // Pure rotation with unit-depth ray (w = 0 strips translation).
-      // Stripping translation (.w = 0) eliminates world forward motion, while
-      // preserving exact angular motion for head rotation and braking/sway pitch.
-      const float4 unit_ray = float4(-ray_xy, -1.f, 0.f);
-      clip_x = dot(cb0[0], unit_ray);
-      clip_y = dot(cb0[1], unit_ray);
-      clip_w = max(dot(cb0[3], unit_ray), 1e-4f);
+      // Cockpit is stationary relative to the camera in driving.
+      // Returning strictly (0, 0) completely eliminates interior ghosting.
+      return float2(0.0f, 0.0f);
    }
-   else
-   {
-      // Full camera reprojection (translation + rotation) for the outside world
-      clip_x = dot(cb0[0], ray);
-      clip_y = dot(cb0[1], ray);
-      clip_w = dot(cb0[3], ray);
-   }
+
+   // Full camera reprojection (translation + rotation) for the outside world
+   const float clip_x = dot(cb0[0], ray);
+   const float clip_y = dot(cb0[1], ray);
+   const float clip_w = dot(cb0[3], ray);
 
    // 0x805A8981: max |xy| ; lt clip.w ; ge 0, clip.w ; or ; if_z
    const bool outside = clip_w <= max(abs(clip_x), abs(clip_y)) || clip_w <= 0.f;

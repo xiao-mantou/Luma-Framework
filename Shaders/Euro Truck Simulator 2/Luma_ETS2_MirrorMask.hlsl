@@ -25,8 +25,6 @@ float main(float4 pos : SV_Position) : SV_Target0
    if (!is_vehicle)
       return 0.0f;
 
-   // Read tunable bias value from cb0[14].x if non-zero, otherwise default to 0.75f
-   const float cabin_bias = (cb0[14].x > 0.0f) ? cb0[14].x : 0.75f;
-
-   return cabin_bias;
+   // Direct pass of tunable bias value from cb0[14].x (respecting 0.0f without fallback)
+   return saturate(cb0[14].x);
 }

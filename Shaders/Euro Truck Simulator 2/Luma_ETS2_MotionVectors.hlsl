@@ -21,6 +21,49 @@ Texture2D<uint4> GBufferFlags : register(t1);
 float2 main(float4 pos : SV_Position) : SV_Target0
 {
    const int2 pixel = int2(pos.xy);
+
+   // 0x805A8981: div l(1), cb0[11].zw ; mul cb0[11].xy  => render size
+   const float2 render_size = cb0[11].xy / max(cb0[11].zw, 1e-6f);
+   const float2 uv = pos.xy / max(render_size, 1e-6f); // v1.xy
+
+   // Read GBuffer flags (SRV 15, R16G16B16A16_UINT):
+   // Disassembly of ETS2 TAA resolve 0x805A8981:
+   //   bit 13 of .w flags vehicle / dynamic mesh geometry
+   const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
+   const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
+
+   // Cabin geometry: 100% governed by the verified vehicle flag (pure red)
+   const bool is_cabin = is_vehicle_flag;
+
+   if (is_cabin)
+   {
+      // The cockpit interior moves rigidly with the truck chassis; its translational velocity
+      // relative to the camera is zero. Stripping translation (w = 0) eliminates forward world motion,
+      // while preserving exact camera angular rotation (head rotation / view look-around).
+      //
+      // In pure 3D rotation, the depth factor (-depth) cancels out completely in NDC perspective division.
+      // We compute the unjittered pixel ray directly from uv (no 3x3 neighbor dilation):
+      float2 cabin_ray_xy = uv * cb0[10].zw;
+      cabin_ray_xy = cabin_ray_xy * cb0[13].zw + cb0[13].xy;
+      const float4 unit_ray = float4(-cabin_ray_xy, -1.f, 0.f);
+
+      const float clip_x = dot(cb0[0], unit_ray);
+      const float clip_y = dot(cb0[1], unit_ray);
+      const float clip_w = dot(cb0[3], unit_ray);
+
+      if (clip_w > 1e-4f)
+      {
+         const float2 ndc = float2(clip_x, clip_y) / clip_w;
+         // Unjittered UV: do NOT add cb0[8].xy because DLSS handles jitter internally via InJitterOffsetX/Y.
+         // Adding jitter here would cause double-jitter high-frequency vibration.
+         const float2 reprojected_uv = ndc * float2(0.5f, -0.5f) + 0.5f;
+         const float2 history_uv = reprojected_uv * cb0[10].xy;
+         return history_uv - uv;
+      }
+      return float2(0.0f, 0.0f);
+   }
+
+   // Full camera reprojection (translation + rotation) for the outside world
    const uint2 packed = PackedDepth.Load(int3(pixel, 0));
 
    // 0x805A8981: utof / mul 0.000244 / exp2 / add -1
@@ -29,10 +72,6 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    // 0x805A8981: and / ubfe / iadd -1 / itof
    const float2 neighbour = float2(float(packed.y & 3u) - 1.f,
                                    float((packed.y >> 2) & 3u) - 1.f);
-
-   // 0x805A8981: div l(1), cb0[11].zw ; mul cb0[11].xy  => render size
-   const float2 render_size = cb0[11].xy / max(cb0[11].zw, 1e-6f);
-   const float2 uv = pos.xy / max(render_size, 1e-6f); // v1.xy
 
    // 0x805A8981: mad r1.xz, ..., cb0[9].yyzy, v1  (x uses .y, y uses .z)
    const float2 neighbour_uv = neighbour * cb0[9].yz + uv;
@@ -45,25 +84,6 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    float4 ray = float4(ray_xy, 1.f, 1.f);
    ray.xyz *= -depth;
 
-   // Read GBuffer flags (SRV 15, R16G16B16A16_UINT):
-   // Disassembly of ETS2 TAA resolve 0x805A8981:
-   //   bit 13 of .w flags vehicle / dynamic mesh geometry
-   const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
-   const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
-
-   // Cabin geometry: 100% governed by the verified perfect vehicle flag (pure red),
-   // removing all depth limits so the entire cockpit is seamlessly covered.
-   const bool is_cabin = is_vehicle_flag;
-
-   if (is_cabin)
-   {
-      // The cockpit interior is stationary relative to the player's camera.
-      // Outputting strictly (0, 0) provides an unjittered stationary vector to DLSS
-      // (DLSS already handles jitter via InJitterOffsetX/Y), completely eliminating jitter and false motion!
-      return float2(0.0f, 0.0f);
-   }
-
-   // Full camera reprojection (translation + rotation) for the outside world
    const float clip_x = dot(cb0[0], ray);
    const float clip_y = dot(cb0[1], ray);
    const float clip_w = dot(cb0[3], ray);

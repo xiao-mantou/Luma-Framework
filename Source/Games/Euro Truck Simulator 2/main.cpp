@@ -74,6 +74,7 @@ static float g_mvs_x_scale_ini = 1920.f;
 static float g_mvs_y_scale_ini = 1080.f;
 static int g_mvs_jittered_ini = 0;
 static float g_cabin_bias_mask_ini = 0.75f;
+static float g_cabin_dlaa_blend_ini = 0.0f;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -137,16 +138,23 @@ struct ETS2DeviceData final : public GameDeviceData
    uint32_t depth_rejected = 0;
    bool depth_logged = false;
    bool depth_func_logged = false;
-   com_ptr<ID3D11Texture2D> zero_mv;        // placeholder: all-zero float2 motion
-   com_ptr<ID3D11Texture2D> const_depth;    // placeholder: constant HW depth
-   com_ptr<ID3D11Texture2D> uav_output;     // proxy when RTV0 lacks UAV
+   com_ptr<ID3D11Texture2D> zero_mv;     // placeholder: all-zero float2 motion
+   com_ptr<ID3D11Texture2D> const_depth; // placeholder: constant HW depth
+   com_ptr<ID3D11Texture2D> uav_output;  // proxy when RTV0 lacks UAV
+   com_ptr<ID3D11ShaderResourceView> uav_output_srv;
+   UINT uav_output_w = 0;
+   UINT uav_output_h = 0;
    com_ptr<ID3D11Texture2D> staging_source; // snapshot when source == output
-   com_ptr<ID3D11Texture2D> bias_mask;      // DLSS reactive / bias mask (R8_UNORM) for rearview mirrors
+   com_ptr<ID3D11ShaderResourceView> staging_source_srv;
+   UINT staging_w = 0;
+   UINT staging_h = 0;
+   com_ptr<ID3D11Texture2D> bias_mask; // DLSS reactive / bias mask (R8_UNORM) for rearview mirrors
    com_ptr<ID3D11RenderTargetView> bias_mask_rtv;
    UINT bias_mask_w = 0;
    UINT bias_mask_h = 0;
    bool bias_mask_logged = false;
    float cabin_bias_mask = 0.75f;
+   float cabin_dlaa_blend = 0.0f;
    uint32_t sr_draws = 0;
    uint32_t sr_failures = 0;
    const char* sr_status = "off";
@@ -679,6 +687,7 @@ static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, D
    for (int i = 0; i < 64; ++i)
       dst[i] = gd.game_cb0[i];
    dst[14 * 4 + 0] = gd.cabin_bias_mask;
+   dst[14 * 4 + 1] = gd.cabin_dlaa_blend;
    ctx->Unmap(gd.game_cb.get(), 0);
 
    DrawStateStack<DrawStateStackType::FullGraphics> state_stack;
@@ -1055,15 +1064,22 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
 
    ID3D11Resource* dlss_output = output_color.get();
    bool need_copy = false;
-   if ((out_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
+   if ((out_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0 || gd.cabin_dlaa_blend < 1.0f)
    {
-      D3D11_TEXTURE2D_DESC uav_desc = out_desc;
-      uav_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-      gd.uav_output = nullptr;
-      if (FAILED(device->CreateTexture2D(&uav_desc, nullptr, &gd.uav_output)) || !gd.uav_output)
+      if (!gd.uav_output || gd.uav_output_w != w || gd.uav_output_h != h)
       {
-         SetSrStatus(gd, "UAV proxy alloc failed");
-         return false;
+         gd.uav_output = nullptr;
+         gd.uav_output_srv = nullptr;
+         gd.uav_output_w = w;
+         gd.uav_output_h = h;
+         D3D11_TEXTURE2D_DESC uav_desc = out_desc;
+         uav_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+         if (FAILED(device->CreateTexture2D(&uav_desc, nullptr, &gd.uav_output)) || !gd.uav_output)
+         {
+            SetSrStatus(gd, "UAV proxy alloc failed");
+            return false;
+         }
+         device->CreateShaderResourceView(gd.uav_output.get(), nullptr, &gd.uav_output_srv);
       }
       dlss_output = gd.uav_output.get();
       need_copy = true;
@@ -1087,12 +1103,19 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    ID3D11Resource* dlss_source = source_color.get();
    if (same_resource)
    {
-      if (!gd.staging_source)
+      if (!gd.staging_source || gd.staging_w != w || gd.staging_h != h)
       {
+         gd.staging_source = nullptr;
+         gd.staging_source_srv = nullptr;
+         gd.staging_w = w;
+         gd.staging_h = h;
          // Keep size/format/mip identical to RTV0 so CopyResource stays legal.
          D3D11_TEXTURE2D_DESC sdesc = out_desc;
          sdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-         device->CreateTexture2D(&sdesc, nullptr, &gd.staging_source);
+         if (SUCCEEDED(device->CreateTexture2D(&sdesc, nullptr, &gd.staging_source)))
+         {
+            device->CreateShaderResourceView(gd.staging_source.get(), nullptr, &gd.staging_source_srv);
+         }
       }
       if (gd.staging_source)
          dlss_source = gd.staging_source.get();
@@ -1185,8 +1208,43 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
 
    if (draw_ok && gd.mark_dlaa_output)
       ApplyDlaaMarker(ctx, dlss_output, w, h);
-   if (draw_ok && need_copy)
-      ctx->CopyResource(output_color.get(), dlss_output);
+
+   if (draw_ok)
+   {
+      const auto comp_ps_it = device_data.native_pixel_shaders.find(CompileTimeStringHash("ETS2 Composite"));
+      const auto vs_it = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
+      ID3D11ShaderResourceView* clean_source_srv = same_resource ? gd.staging_source_srv.get() : srvs[slot].get();
+
+      if (gd.cabin_dlaa_blend < 1.0f && comp_ps_it != device_data.native_pixel_shaders.end() && comp_ps_it->second &&
+          vs_it != device_data.native_vertex_shaders.end() && vs_it->second &&
+          gd.uav_output_srv && clean_source_srv && srvs[15] && rtv)
+      {
+         DrawStateStack<DrawStateStackType::FullGraphics> comp_stack;
+         comp_stack.Cache(ctx, device_data.uav_max_count);
+
+         if (gd.game_cb)
+         {
+            ID3D11Buffer* cb = gd.game_cb.get();
+            ctx->PSSetConstantBuffers(0, 1, &cb);
+         }
+
+         ID3D11ShaderResourceView* comp_srvs[2] = {clean_source_srv, srvs[15].get()};
+         ctx->PSSetShaderResources(1, 2, comp_srvs);
+
+         DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
+            nullptr, vs_it->second.get(), comp_ps_it->second.get(), gd.uav_output_srv.get(), rtv.get(),
+            w, h, false, "ETS2 Composite");
+
+         ID3D11ShaderResourceView* null_comp[3] = {nullptr, nullptr, nullptr};
+         ctx->PSSetShaderResources(0, 3, null_comp);
+
+         comp_stack.Restore(ctx);
+      }
+      else if (need_copy)
+      {
+         ctx->CopyResource(output_color.get(), dlss_output);
+      }
+   }
 
    ID3D11ShaderResourceView* restore_srvs[16] = {};
    for (int i = 0; i < 16; ++i)
@@ -1244,6 +1302,8 @@ public:
          ShaderDefinition{"Luma_ETS2_MirrorMask", reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("ETS2 Debug Mask"),
          ShaderDefinition{"Luma_ETS2_DebugMask", reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("ETS2 Composite"),
+         ShaderDefinition{"Luma_ETS2_Composite", reshade::api::pipeline_subobject_type::pixel_shader});
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES); // Make sure there's room for at least one extra custom define to add for development (this isn't really relevant outside of development)
 
       // Define these according to the game's original technical details and the mod's implementation (see their declarations for more).
@@ -1297,6 +1357,7 @@ public:
       gd->mvs_y_scale = g_mvs_y_scale_ini;
       gd->mvs_jittered = g_mvs_jittered_ini != 0;
       gd->cabin_bias_mask = g_cabin_bias_mask_ini;
+      gd->cabin_dlaa_blend = g_cabin_dlaa_blend_ini;
 #endif
    }
 
@@ -1329,6 +1390,7 @@ public:
                                    " same=" + std::to_string(game_device_data.source_equals_output ? 1 : 0) +
                                    " dsv=" + std::to_string(game_device_data.depth_w) + "x" + std::to_string(game_device_data.depth_h) +
                                    " mask=" + std::to_string(game_device_data.bias_mask ? 1 : 0) +
+                                   " blend=" + std::to_string(game_device_data.cabin_dlaa_blend) +
                                    " invz=" + std::to_string(game_device_data.inverted_depth);
             reshade::log::message(reshade::log::level::warning, hb.c_str());
          }
@@ -1400,6 +1462,7 @@ public:
       reshade::get_config_value(runtime, NAME, "MvsYScale", g_mvs_y_scale_ini);
       reshade::get_config_value(runtime, NAME, "MvsJittered", g_mvs_jittered_ini);
       reshade::get_config_value(runtime, NAME, "CabinBiasMask", g_cabin_bias_mask_ini);
+      reshade::get_config_value(runtime, NAME, "CabinDlaaBlend", g_cabin_dlaa_blend_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -1423,6 +1486,10 @@ public:
       if (ImGui::SliderFloat("Cabin Bias Mask (Reactive)", &game_device_data.cabin_bias_mask, 0.0f, 1.0f, "%.2f"))
       {
          reshade::set_config_value(runtime, NAME, "CabinBiasMask", game_device_data.cabin_bias_mask);
+      }
+      if (ImGui::SliderFloat("Cabin DLAA Blend (Hybrid)", &game_device_data.cabin_dlaa_blend, 0.0f, 1.0f, "%.2f"))
+      {
+         reshade::set_config_value(runtime, NAME, "CabinDlaaBlend", game_device_data.cabin_dlaa_blend);
       }
       ImGui::Text("status: %s", game_device_data.sr_status);
       if (ImGui::Checkbox("Test output path (solid red, skips DLSS)", &game_device_data.test_output_path))

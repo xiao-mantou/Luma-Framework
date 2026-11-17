@@ -37,29 +37,10 @@ float2 main(float4 pos : SV_Position) : SV_Target0
 
    if (is_cabin)
    {
-      // The cockpit interior moves rigidly with the truck chassis; its translational velocity
-      // relative to the camera is zero. Stripping translation (w = 0) eliminates forward world motion,
-      // while preserving exact camera angular rotation (head rotation / view look-around).
-      //
-      // We compute the pixel ray directly from uv (no 3x3 neighbor dilation):
-      float2 cabin_ray_xy = uv * cb0[10].zw;
-      cabin_ray_xy = cabin_ray_xy * cb0[13].zw + cb0[13].xy;
-      const float4 unit_ray = float4(-cabin_ray_xy, -1.f, 0.f);
-
-      const float clip_x = dot(cb0[0], unit_ray);
-      const float clip_y = dot(cb0[1], unit_ray);
-      const float clip_w = dot(cb0[3], unit_ray);
-
-      if (clip_w > 1e-4f)
-      {
-         const float2 ndc = float2(clip_x, clip_y) / clip_w;
-         // Crucial: + cb0[8].xy cancels the projection matrix jitter difference between frames!
-         // Without + cb0[8].xy, the reprojection matrix leaves ~0.3..0.58px jitter residue,
-         // causing high-frequency micro-vibration and edge blurring on close-up interior details.
-         const float2 reprojected_uv = ndc * float2(0.5f, -0.5f) + 0.5f + cb0[8].xy;
-         const float2 history_uv = reprojected_uv * cb0[10].xy;
-         return history_uv - uv;
-      }
+      // The cockpit interior is stationary relative to the camera in driving.
+      // Returning strictly (0, 0) provides an unjittered stationary vector to DLSS, eliminating
+      // any fake world motion or suspension tilt artifacts.
+      // The Hybrid Composite pass will seamlessly composite the razor-sharp native source over the cabin!
       return float2(0.0f, 0.0f);
    }
 

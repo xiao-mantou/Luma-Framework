@@ -52,11 +52,13 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
 
    // Cabin & mirror geometry:
-   // With DLSS Reactive Mask (draw.bias_mask / pInBiasCurrentColorMask) active,
-   // mirror reflections are refreshed via NVIDIA's official Reactive channel.
-   // The entire cabin (dashboard, pillars, mirror frames and mirror glass) shares
-   // uniform pure-rotation reprojection and jitter cancellation for zero vibration.
-   const bool is_cabin = is_vehicle_flag && (depth < 8.0f);
+   // 1. GBuffer t15 bit 13 marks vehicle geometry (cab, hood, mirrors) within 8 meters.
+   // 2. Tight depth < 2.0m fallback guarantees that ALL cabin interior parts
+   //    (steering wheel, dashboard, gauges, pillars, interior trim) are 100% captured,
+   //    even if certain interior sub-meshes lack bit 13 in GBuffer.
+   //    (In ETS2 cabin view, distance to windshield is ~1.5m; closest visible ground
+   //     in front of the truck is >3.8m away, so depth < 2.0m will never touch the road).
+   const bool is_cabin = (is_vehicle_flag && depth < 8.0f) || (depth < 2.0f);
 
    float clip_x, clip_y, clip_w;
    if (is_cabin)

@@ -746,8 +746,25 @@ static void DrawMirrorMask(ID3D11Device* device, ID3D11DeviceContext* ctx, Devic
    UINT num_vp = 1;
    D3D11_VIEWPORT vp = {};
    ctx->RSGetViewports(&num_vp, &vp);
-   const UINT w = (vp.Width > 0.f) ? static_cast<UINT>(vp.Width) : (gd.target_w > 0 ? gd.target_w : 2560);
-   const UINT h = (vp.Height > 0.f) ? static_cast<UINT>(vp.Height) : (gd.target_h > 0 ? gd.target_h : 1440);
+
+   const UINT main_w = (gd.target_w > 0) ? gd.target_w : static_cast<UINT>(device_data.output_resolution.x);
+   const UINT main_h = (gd.target_h > 0) ? gd.target_h : static_cast<UINT>(device_data.output_resolution.y);
+
+   // Strictly match the main scene viewport dimensions.
+   // Filters out off-screen render passes (such as the 512x512 rearview mirror RT passes).
+   if (main_w > 0 && main_h > 0)
+   {
+      if (static_cast<UINT>(vp.Width) != main_w || static_cast<UINT>(vp.Height) != main_h)
+         return;
+   }
+   else
+   {
+      if (vp.Width < 1000.f || vp.Height < 700.f)
+         return;
+   }
+
+   const UINT w = (main_w > 0) ? main_w : static_cast<UINT>(vp.Width);
+   const UINT h = (main_h > 0) ? main_h : static_cast<UINT>(vp.Height);
 
    if (!gd.bias_mask || gd.bias_mask_w != w || gd.bias_mask_h != h)
    {

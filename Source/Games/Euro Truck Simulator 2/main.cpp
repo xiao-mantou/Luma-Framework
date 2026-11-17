@@ -73,6 +73,7 @@ static int g_invert_jitter_y_ini = 0; // 0 = sign +1
 static float g_mvs_x_scale_ini = 1920.f;
 static float g_mvs_y_scale_ini = 1080.f;
 static int g_mvs_jittered_ini = 0;
+static float g_cabin_bias_mask_ini = 0.75f;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
@@ -145,6 +146,7 @@ struct ETS2DeviceData final : public GameDeviceData
    UINT bias_mask_w = 0;
    UINT bias_mask_h = 0;
    bool bias_mask_logged = false;
+   float cabin_bias_mask = 0.75f;
    uint32_t sr_draws = 0;
    uint32_t sr_failures = 0;
    const char* sr_status = "off";
@@ -676,6 +678,7 @@ static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, D
    float* dst = static_cast<float*>(m.pData);
    for (int i = 0; i < 64; ++i)
       dst[i] = gd.game_cb0[i];
+   dst[14 * 4 + 0] = gd.cabin_bias_mask;
    ctx->Unmap(gd.game_cb.get(), 0);
 
    DrawStateStack<DrawStateStackType::FullGraphics> state_stack;
@@ -716,6 +719,8 @@ static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, D
          const auto mask_ps_it = device_data.native_pixel_shaders.find(CompileTimeStringHash("ETS2 Mirror Mask"));
          if (mask_ps_it != device_data.native_pixel_shaders.end() && mask_ps_it->second)
          {
+            ID3D11Buffer* cb_mask = gd.game_cb.get();
+            ctx->PSSetConstantBuffers(0, 1, &cb_mask);
             DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
                nullptr, vs_it->second.get(), mask_ps_it->second.get(), gbuffer_srv, gd.bias_mask_rtv.get(),
                w, h, false, "ETS2 Mirror Mask");
@@ -1291,6 +1296,7 @@ public:
       gd->mvs_x_scale = g_mvs_x_scale_ini;
       gd->mvs_y_scale = g_mvs_y_scale_ini;
       gd->mvs_jittered = g_mvs_jittered_ini != 0;
+      gd->cabin_bias_mask = g_cabin_bias_mask_ini;
 #endif
    }
 
@@ -1393,6 +1399,7 @@ public:
       reshade::get_config_value(runtime, NAME, "MvsXScale", g_mvs_x_scale_ini);
       reshade::get_config_value(runtime, NAME, "MvsYScale", g_mvs_y_scale_ini);
       reshade::get_config_value(runtime, NAME, "MvsJittered", g_mvs_jittered_ini);
+      reshade::get_config_value(runtime, NAME, "CabinBiasMask", g_cabin_bias_mask_ini);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -1413,6 +1420,10 @@ public:
       }
       ImGui::Text("DLAA draws: %u  failures: %u", game_device_data.sr_draws, game_device_data.sr_failures);
       ImGui::Text("Mirror reactive mask: %s", game_device_data.bias_mask ? "active" : "off");
+      if (ImGui::SliderFloat("Cabin Bias Mask (Reactive)", &game_device_data.cabin_bias_mask, 0.0f, 1.0f, "%.2f"))
+      {
+         reshade::set_config_value(runtime, NAME, "CabinBiasMask", game_device_data.cabin_bias_mask);
+      }
       ImGui::Text("status: %s", game_device_data.sr_status);
       if (ImGui::Checkbox("Test output path (solid red, skips DLSS)", &game_device_data.test_output_path))
       {

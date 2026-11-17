@@ -1,16 +1,32 @@
-// Euro Truck Simulator 2 DLAA - Mirror & Dynamic Screen Reactive Mask
-// Reads GBuffer flags (SRV 15, R16G16B16A16_UINT) written by geometry pass.
-// Disassembly of ETS2 TAA resolve 0x805A8981 (lines 5-8, 67, 136, 262):
-//   bit 0 of .z marks rearview mirror glass and dynamic electronic screens.
-// When true, original TAA discards history and blends current frame with 100% weight.
-// We write 1.0f into DLSS Reactive / Bias Current Color Mask (pInBiasCurrentColorMask)
-// to eliminate temporal smear/ghosting inside rearview mirror reflections.
+// Euro Truck Simulator 2 DLAA - Cockpit & Mirror Reactive Bias Mask
+// Feeds DLSS pInBiasCurrentColorMask to eliminate ghosting and smearing.
+//
+// GBuffer flags (SRV 15, R16G16B16A16_UINT):
+//   bit 13 of .w flags vehicle / cockpit interior geometry
+//
+// Constant Buffer b0:
+//   cb0[14].x carries the user-tunable Cabin Bias Mask from the Luma ImGui panel (default 0.75f)
+
+cbuffer GameCB0 : register(b0)
+{
+   float4 cb0[16];
+};
 
 Texture2D<uint4> GBufferFlags : register(t0);
 
 float main(float4 pos : SV_Position) : SV_Target0
 {
-   const uint4 gbuffer = GBufferFlags.Load(int3(pos.xy, 0));
-   const bool is_mirror_glass = ((gbuffer.z & 1u) != 0u);
-   return is_mirror_glass ? 1.0f : 0.0f;
+   const int2 pixel = int2(pos.xy);
+   const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
+
+   // Bit 13 of .w flags vehicle interior geometry (verified by user via Debug Mask)
+   const bool is_vehicle = ((gbuffer.w >> 13) & 1u) != 0u;
+
+   if (!is_vehicle)
+      return 0.0f;
+
+   // Read tunable bias value from cb0[14].x if non-zero, otherwise default to 0.75f
+   const float cabin_bias = (cb0[14].x > 0.0f) ? cb0[14].x : 0.75f;
+
+   return cabin_bias;
 }

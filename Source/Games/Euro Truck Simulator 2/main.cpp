@@ -688,6 +688,8 @@ static bool BuildMotionVectors(ID3D11Device* device, ID3D11DeviceContext* ctx, D
       dst[i] = gd.game_cb0[i];
    dst[14 * 4 + 0] = gd.cabin_bias_mask;
    dst[14 * 4 + 1] = gd.cabin_dlaa_blend;
+   dst[14 * 4 + 2] = gd.jitter_uv_x;
+   dst[14 * 4 + 3] = gd.jitter_uv_y;
    ctx->Unmap(gd.game_cb.get(), 0);
 
    DrawStateStack<DrawStateStackType::FullGraphics> state_stack;
@@ -1232,11 +1234,13 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
          ctx->PSSetShaderResources(1, 2, comp_srvs);
 
          DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
-            nullptr, vs_it->second.get(), comp_ps_it->second.get(), gd.uav_output_srv.get(), rtv.get(),
+            device_data.sampler_state_linear.get(), vs_it->second.get(), comp_ps_it->second.get(), gd.uav_output_srv.get(), rtv.get(),
             w, h, false, "ETS2 Composite");
 
          ID3D11ShaderResourceView* null_comp[3] = {nullptr, nullptr, nullptr};
          ctx->PSSetShaderResources(0, 3, null_comp);
+         ID3D11SamplerState* null_sampler = nullptr;
+         ctx->PSSetSamplers(0, 1, &null_sampler);
 
          comp_stack.Restore(ctx);
       }

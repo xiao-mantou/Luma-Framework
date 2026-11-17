@@ -51,15 +51,16 @@ float2 main(float4 pos : SV_Position) : SV_Target0
    const uint4 gbuffer = GBufferFlags.Load(int3(pixel, 0));
    const bool is_vehicle_flag = ((gbuffer.w >> 13) & 1u) != 0;
 
-   // Cabin geometry: vehicle flag combined with near depth (< 2.5m) to strictly
-   // isolate the cockpit interior while leaving external AI traffic to world reprojection.
-   const bool is_cabin = is_vehicle_flag && (depth < 2.5f);
+   // Cabin geometry: 100% governed by the verified perfect vehicle flag (pure red),
+   // removing all depth limits so the entire cockpit is seamlessly covered.
+   const bool is_cabin = is_vehicle_flag;
 
    if (is_cabin)
    {
-      // Cockpit is stationary relative to the camera in driving.
-      // Returning strictly (0, 0) completely eliminates interior ghosting.
-      return float2(0.0f, 0.0f);
+      // The cockpit interior is stationary relative to the player's camera.
+      // Returning cb0[8].xy perfectly cancels the subpixel projection jitter,
+      // eliminating high-frequency edge ghosting without introducing world translation.
+      return cb0[8].xy;
    }
 
    // Full camera reprojection (translation + rotation) for the outside world

@@ -64,7 +64,7 @@ static int g_enable_dlaa_ini = 0;
 static int g_test_output_path_ini = 0;
 static int g_bypass_ngx_ini = 0;
 static int g_debug_view_mask_ini = 0;
-static int g_source_slot_ini = 1; // 1 = slot 1 (current frame jittered colour in ETS2 #6128)
+static int g_source_slot_ini = 0; // 0 = slot 0 (current frame pure colour in ETS2 #6128; slot 1 is TAA history)
 static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
 static int g_use_game_jitter_ini = 1;
@@ -800,13 +800,13 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    int slot = gd.source_slot;
    if (slot < 0 || slot > 7)
    {
-      if (srv_res[1] && !srv_same[1] && srv_fmt[1] == DXGI_FORMAT_R16G16B16A16_FLOAT)
+      if (srv_res[0] && !srv_same[0] && srv_fmt[0] == DXGI_FORMAT_R16G16B16A16_FLOAT)
       {
-         slot = 1;
+         slot = 0;
       }
       else
       {
-         slot = 0;
+         slot = 1;
          for (int i = 0; i < 8; ++i)
          {
             if (srv_res[i] && !srv_same[i] && srv_fmt[i] == DXGI_FORMAT_R16G16B16A16_FLOAT)

@@ -60,36 +60,36 @@
 static constexpr uint32_t kTaaResolvePS = 0x805A8981u;
 // LoadConfigs() has no DeviceData, so ini values are staged here and copied in OnCreateDevice().
 static int g_cancel_taa_resolve_ini = 0;
-static int g_enable_dlaa_ini = 0;
+static int g_enable_dlaa_ini = 1;
 static int g_test_output_path_ini = 0;
 static int g_bypass_ngx_ini = 0;
 static int g_debug_view_mask_ini = 0;
-static int g_source_slot_ini = 0; // 0 = slot 0 (current frame pure colour in ETS2 #6128; slot 1 is TAA history)
+static int g_source_slot_ini = 1; // 1 = lighting pass in ETS2 #6128
 static int g_keep_engine_resolve_ini = 1;
 static int g_mark_dlaa_output_ini = 0;
 static int g_use_game_jitter_ini = 1;
 static int g_invert_jitter_x_ini = 0; // 0 = sign +1
 static int g_invert_jitter_y_ini = 0; // 0 = sign +1
-static float g_mvs_x_scale_ini = 1920.f;
-static float g_mvs_y_scale_ini = 1080.f;
+static float g_mvs_x_scale_ini = 0.f; // 0 = auto match screen resolution
+static float g_mvs_y_scale_ini = 0.f; // 0 = auto match screen resolution
 static int g_mvs_jittered_ini = 0;
 static float g_cabin_bias_mask_ini = 0.75f;
-static float g_cabin_dlaa_blend_ini = 0.0f;
+static float g_cabin_dlaa_blend_ini = 0.5f;
 
 struct ETS2DeviceData final : public GameDeviceData
 {
    bool has_drawn_taa_resolve = false;
    uint32_t taa_resolve_hits = 0; // cumulative, shown in the ImGui panel
    uint32_t frame_index = 0;
-   bool enable_dlaa = false;          // v2 stage 2: real DLAA, still off
+   bool enable_dlaa = true;           // v2 stage 2: real DLAA (default ON)
    bool cancel_taa_resolve = false;   // v2 stage 1 debug toggle
    bool dlaa_drew_this_frame = false; // reset every OnPresent; do NOT use core's has_drawn_sr
    bool test_output_path = false;     // debug: copy a solid red texture instead of running DLSS
 #if ENABLE_SR
    bool bypass_ngx = false;      // debug: copy the colour SRV straight into RTV0
    bool debug_view_mask = false; // debug: visualize GBuffer flags and depth on screen
-   int source_slot = -1;         // -1 = auto
-   int resolved_source_slot = 0;
+   int source_slot = 1;          // default 1 (lighting pass)
+   int resolved_source_slot = 1;
    bool source_equals_output = false; // true => NGX would read back its own output
    bool keep_engine_resolve = true;   // run the original draw first, then overwrite RTV0
    bool original_draw_available = false;
@@ -120,8 +120,8 @@ struct ETS2DeviceData final : public GameDeviceData
    com_ptr<ID3D11Buffer> game_cb;
    float game_cb0[64] = {};
    bool game_cb0_valid = false;
-   float mvs_x_scale = 1920.f;
-   float mvs_y_scale = 1080.f;
+   float mvs_x_scale = 0.f;
+   float mvs_y_scale = 0.f;
    bool mvs_jittered = false;
    bool mv_ready = false;
    bool mv_logged = false;
@@ -154,7 +154,7 @@ struct ETS2DeviceData final : public GameDeviceData
    UINT bias_mask_h = 0;
    bool bias_mask_logged = false;
    float cabin_bias_mask = 0.75f;
-   float cabin_dlaa_blend = 0.0f;
+   float cabin_dlaa_blend = 0.5f;
    uint32_t sr_draws = 0;
    uint32_t sr_failures = 0;
    const char* sr_status = "off";
@@ -1042,19 +1042,17 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
    settings.inverted_depth = gd.inverted_depth != 0; // set from the geometry pass DepthFunc
    settings.mvs_jittered = gd.mvs_jittered;
    settings.auto_exposure = false;
-   if ((gd.mvs_x_scale == 0.f || fabsf(gd.mvs_x_scale) == 1920.f) && w > 0 && w != 1920)
-      gd.mvs_x_scale = (gd.mvs_x_scale < 0.f ? -1.f : 1.f) * static_cast<float>(w);
-   if ((gd.mvs_y_scale == 0.f || fabsf(gd.mvs_y_scale) == 1080.f) && h > 0 && h != 1080)
-      gd.mvs_y_scale = (gd.mvs_y_scale < 0.f ? -1.f : 1.f) * static_cast<float>(h);
-   settings.mvs_x_scale = gd.mvs_x_scale;
-   settings.mvs_y_scale = gd.mvs_y_scale;
+   const float final_mvs_x = (gd.mvs_x_scale != 0.f) ? gd.mvs_x_scale : static_cast<float>(w);
+   const float final_mvs_y = (gd.mvs_y_scale != 0.f) ? gd.mvs_y_scale : static_cast<float>(h);
+   settings.mvs_x_scale = final_mvs_x;
+   settings.mvs_y_scale = final_mvs_y;
    settings.render_preset = dlss_render_preset;
    static bool logged_scale = false;
    if (!logged_scale)
    {
       logged_scale = true;
-      const std::string scale_msg = "[ETS2 DLAA] mvs_scale (" + std::to_string(gd.mvs_x_scale) + ", " +
-                                    std::to_string(gd.mvs_y_scale) + ") res " + std::to_string(w) + "x" + std::to_string(h);
+      const std::string scale_msg = "[ETS2 DLAA] mvs_scale (" + std::to_string(final_mvs_x) + ", " +
+                                    std::to_string(final_mvs_y) + ") res " + std::to_string(w) + "x" + std::to_string(h);
       reshade::log::message(reshade::log::level::warning, scale_msg.c_str());
    }
    if (!impl->UpdateSettings(instance, ctx, settings))
@@ -1536,37 +1534,33 @@ public:
       ImGui::Text("depth %ux%u fmt=%d depth_func=%d reversed_z=%d captured=%d", game_device_data.depth_w,
          game_device_data.depth_h, game_device_data.depth_format, game_device_data.depth_func,
          game_device_data.inverted_depth, game_device_data.main_depth ? 1 : 0);
-      if (ImGui::InputFloat("MV X scale", &game_device_data.mvs_x_scale, 1.f, 100.f, "%.1f"))
+      bool manual_mv_scale = (game_device_data.mvs_x_scale != 0.f || game_device_data.mvs_y_scale != 0.f);
+      if (ImGui::Checkbox("Manual MV Resolution Scale", &manual_mv_scale))
+      {
+         if (manual_mv_scale)
+         {
+            game_device_data.mvs_x_scale = game_device_data.target_w ? static_cast<float>(game_device_data.target_w) : 2560.f;
+            game_device_data.mvs_y_scale = game_device_data.target_h ? static_cast<float>(game_device_data.target_h) : 1440.f;
+         }
+         else
+         {
+            game_device_data.mvs_x_scale = 0.f;
+            game_device_data.mvs_y_scale = 0.f;
+         }
          reshade::set_config_value(runtime, NAME, "MvsXScale", game_device_data.mvs_x_scale);
-      if (ImGui::InputFloat("MV Y scale", &game_device_data.mvs_y_scale, 1.f, 100.f, "%.1f"))
          reshade::set_config_value(runtime, NAME, "MvsYScale", game_device_data.mvs_y_scale);
-      auto set_scales = [&](float x, float y)
-      {
-         game_device_data.mvs_x_scale = x;
-         game_device_data.mvs_y_scale = y;
-         reshade::set_config_value(runtime, NAME, "MvsXScale", x);
-         reshade::set_config_value(runtime, NAME, "MvsYScale", y);
-      };
-      if (ImGui::Button("Match Res"))
-      {
-         const float rw = game_device_data.target_w ? static_cast<float>(game_device_data.target_w) : 1920.f;
-         const float rh = game_device_data.target_h ? static_cast<float>(game_device_data.target_h) : 1080.f;
-         set_scales(rw, rh);
       }
-      ImGui::SameLine();
-      ImGui::Text("(Target: %ux%u)", game_device_data.target_w, game_device_data.target_h);
-      ImGui::SameLine();
-      if (ImGui::Button("+1920/+1080"))
-         set_scales(1920.f, 1080.f);
-      ImGui::SameLine();
-      if (ImGui::Button("-1920/+1080"))
-         set_scales(-1920.f, 1080.f);
-      ImGui::SameLine();
-      if (ImGui::Button("+1920/-1080"))
-         set_scales(1920.f, -1080.f);
-      ImGui::SameLine();
-      if (ImGui::Button("-1920/-1080"))
-         set_scales(-1920.f, -1080.f);
+      if (manual_mv_scale)
+      {
+         if (ImGui::InputFloat("MV X scale", &game_device_data.mvs_x_scale, 1.f, 100.f, "%.1f"))
+            reshade::set_config_value(runtime, NAME, "MvsXScale", game_device_data.mvs_x_scale);
+         if (ImGui::InputFloat("MV Y scale", &game_device_data.mvs_y_scale, 1.f, 100.f, "%.1f"))
+            reshade::set_config_value(runtime, NAME, "MvsYScale", game_device_data.mvs_y_scale);
+      }
+      else
+      {
+         ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "MV Scale: Auto (Matching Screen %ux%u)", game_device_data.target_w, game_device_data.target_h);
+      }
       if (ImGui::Checkbox("MVs jittered", &game_device_data.mvs_jittered))
       {
          int value = game_device_data.mvs_jittered ? 1 : 0;

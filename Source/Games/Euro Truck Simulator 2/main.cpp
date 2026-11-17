@@ -84,9 +84,9 @@ struct ETS2DeviceData final : public GameDeviceData
    bool dlaa_drew_this_frame = false; // reset every OnPresent; do NOT use core's has_drawn_sr
    bool test_output_path = false;     // debug: copy a solid red texture instead of running DLSS
 #if ENABLE_SR
-   bool bypass_ngx = false; // debug: copy the colour SRV straight into RTV0
+   bool bypass_ngx = false;      // debug: copy the colour SRV straight into RTV0
    bool debug_view_mask = false; // debug: visualize GBuffer flags and depth on screen
-   int source_slot = -1;    // -1 = auto
+   int source_slot = -1;         // -1 = auto
    int resolved_source_slot = 0;
    bool source_equals_output = false; // true => NGX would read back its own output
    bool keep_engine_resolve = true;   // run the original draw first, then overwrite RTV0
@@ -980,7 +980,7 @@ static bool TryDrawDLAA(ID3D11Device* device, ID3D11DeviceContext* ctx, DeviceDa
             ID3D11Buffer* cb = gd.game_cb.get();
             ctx->PSSetConstantBuffers(0, 1, &cb);
          }
-         ID3D11ShaderResourceView* dbg_srvs[2] = { srvs[4].get(), source_color.get() };
+         ID3D11ShaderResourceView* dbg_srvs[2] = {srvs[4].get(), srvs[slot].get()};
          ctx->PSSetShaderResources(1, 2, dbg_srvs);
          DrawCustomPixelShader(ctx, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(),
             nullptr, vs_it->second.get(), ps_it->second.get(), srvs[15].get(), rtv.get(),
